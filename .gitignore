@@ -2,3 +2,13 @@ node_modules/
 __pycache__/
 venv/
 dataset/
+dist/
+
+VIdeo Testing/*
+!VIdeo Testing/.gitkeep
+
+Gambar testing/*
+!Gambar testing/.gitkeep
+
+model dan dataset/*
+!model dan dataset/.gitkeep
