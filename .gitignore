@@ -3,6 +3,7 @@ __pycache__/
 venv/
 dataset/
 dist/
+.env
 
 VIdeo Testing/*
 !VIdeo Testing/.gitkeep

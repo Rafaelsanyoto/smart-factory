@@ -29,6 +29,26 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VIDEO_DIR = os.path.join(BASE_DIR, "VIdeo Testing")
 MODEL_DIR = os.path.join(BASE_DIR, "model dan dataset")
 
+
+def _load_dotenv(path):
+    """Minimal .env loader (no external dependency). Real environment variables that
+    are already set take precedence over the file — same behavior as python-dotenv."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key:
+                os.environ.setdefault(key, val)
+
+
+_load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 MODEL_REGISTRY = {
     "yolov11m": {"label": "YOLOv11m", "path": os.path.join(MODEL_DIR, "yolo v11.pt")},
     "yolo26m": {"label": "YOLO26m", "path": os.path.join(MODEL_DIR, "yolo v26.pt")},
@@ -140,18 +160,47 @@ def is_context_visible(class_name):
 # Server-side rule engine state + stub AI Agent
 # ---------------------------------------------------------------------------
 events = []            # rolling list of structured events, newest first
-active_keys = {}       # track-level dedup key -> last_seen_ms
-class_cooldown = {}    # "{stream_id}|{cls}" -> last event timestamp_ms
 notifications = []     # AI Agent activity log, newest first
 engine_lock = threading.Lock()
 
-EVENT_EXPIRY_MS = 3000
-# Suppresses a fresh event for the same violation/emergency class in the same zone for
-# this long after the last one fired — absorbs YOLO tracker ID churn (a person losing and
-# regaining a track_id would otherwise look like a "new" person and spam duplicate events).
-CLASS_COOLDOWN_MS = 30_000
+# Episode tracking, keyed by "{stream_id}|{cls}" (zone + violation/emergency class) ->
+# a LIST of concurrent episodes, one per distinct physical location. We deliberately
+# don't key by track_id, since the YOLO tracker reassigns IDs too often to be a reliable
+# person identity — instead, episodes are matched by bounding-box overlap (IoU), so two
+# people committing the same violation in different spots (at once, or one after the
+# other) are recognized as separate occurrences instead of collapsing into one.
+# Each entry: {"first_seen_ms", "last_seen_ms", "notified", "last_box"}.
+#
+# - CONFIRM_MS: a matched episode must persist this long before it's considered real and
+#   a notification fires — absorbs single-frame flicker.
+# - EPISODE_GAP_MS: an episode not matched by any box for longer than this is dropped —
+#   the next box at/near that spot starts a brand new episode (and must reconfirm).
+# - MATCH_IOU_THRESHOLD: how much a new box must overlap an existing episode's last known
+#   position to be considered "the same occurrence still there" rather than a new one.
+#   Known limitation: if a different person happens to stand in nearly the exact same
+#   spot within the gap window, they'll be merged into the same episode — an accepted
+#   trade-off given there's no reliable per-person identity available.
+episodes = {}
+CONFIRM_MS = 5_000
+EPISODE_GAP_MS = 30_000
+MATCH_IOU_THRESHOLD = 0.2
 MAX_EVENTS = 100
 MAX_NOTIFICATIONS = 100
+
+
+def _iou(box_a, box_b):
+    """Intersection-over-union of two [x1,y1,x2,y2] boxes."""
+    xa1, ya1, xa2, ya2 = box_a
+    xb1, yb1, xb2, yb2 = box_b
+    inter_w = max(0.0, min(xa2, xb2) - max(xa1, xb1))
+    inter_h = max(0.0, min(ya2, yb2) - max(ya1, yb1))
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+    area_a = max(0.0, xa2 - xa1) * max(0.0, ya2 - ya1)
+    area_b = max(0.0, xb2 - xb1) * max(0.0, yb2 - yb1)
+    union = area_a + area_b - inter_area
+    return inter_area / union if union > 0 else 0.0
 
 latest_detections = {"stream_01": [], "stream_02": []}
 
@@ -261,6 +310,10 @@ def notify_safety(event):
 def process_rules(stream_id, boxes):
     """Server-side rule engine. Turns raw detections into structured events.
 
+    Episode model, keyed by zone+class with spatial (IoU) matching across concurrent
+    episodes (see `episodes` docstring above) — deliberately ignores track_id since the
+    tracker can't reliably re-identify a person; position across consecutive frames is
+    a much more stable signal than its assigned ID.
     Called from each camera's ai_loop (multiple threads) -> guarded by engine_lock.
     """
     now_ms = time.time() * 1000
@@ -278,26 +331,50 @@ def process_rules(stream_id, boxes):
             else:
                 continue
 
-            track_id = box.get("track_id")
-            key = f"{stream_id}|{track_id}|{cls}"
-            is_new = key not in active_keys
-            active_keys[key] = now_ms
+            key = f"{stream_id}|{cls}"
+            box_xyxy = box.get("xyxy")
+            # Drop episodes that haven't been matched in a while — also prevents a stale
+            # position from wrongly absorbing an unrelated future occurrence.
+            active = [e for e in episodes.get(key, []) if now_ms - e["last_seen_ms"] <= EPISODE_GAP_MS]
 
-            if is_new:
-                cooldown_key = f"{stream_id}|{cls}"
-                last_fired = class_cooldown.get(cooldown_key, 0)
-                if now_ms - last_fired < CLASS_COOLDOWN_MS:
-                    continue  # same violation type still cooling down in this zone — skip
-                class_cooldown[cooldown_key] = now_ms
+            match = None
+            if box_xyxy:
+                best_iou = MATCH_IOU_THRESHOLD
+                for ep in active:
+                    iou = _iou(box_xyxy, ep["last_box"])
+                    if iou >= best_iou:
+                        best_iou = iou
+                        match = ep
 
+            if match is not None:
+                match["last_seen_ms"] = now_ms
+                match["last_box"] = box_xyxy
+                state = match
+            else:
+                # No existing episode overlaps this box's position -> a distinct
+                # occurrence (different person / different spot), even if another
+                # episode of the same class is still active elsewhere in this zone.
+                state = {
+                    "first_seen_ms": now_ms,
+                    "last_seen_ms": now_ms,
+                    "notified": False,
+                    "last_box": box_xyxy or [0, 0, 0, 0],
+                }
+                active.append(state)
+
+            episodes[key] = active
+
+            if not state["notified"] and (now_ms - state["first_seen_ms"]) >= CONFIRM_MS:
+                state["notified"] = True
                 event = {
                     "id": str(uuid.uuid4()),
                     "timestamp": time.strftime("%H:%M:%S"),
+                    "ts_ms": now_ms,  # epoch ms, for the agent's "last N minutes" filtering
                     "stream_id": stream_id,
                     "zone": zone,
                     "type": event_type,
                     "class": cls,
-                    "track_id": track_id,
+                    "track_id": box.get("track_id"),
                     "confidence": box.get("confidence"),
                     "status": "PENDING",
                 }
@@ -305,10 +382,10 @@ def process_rules(stream_id, boxes):
                 del events[MAX_EVENTS:]
                 notify_safety(event)
 
-        # Expire keys not seen recently so the same person re-alerts after leaving
-        for k in list(active_keys.keys()):
-            if now_ms - active_keys[k] > EVENT_EXPIRY_MS:
-                del active_keys[k]
+            # Surface the rule engine's decision back on the box itself, so the UI can
+            # show which detections are suppressed (already notified this episode) vs
+            # still pending confirmation.
+            box["episode_status"] = "notified" if state["notified"] else "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -420,12 +497,18 @@ class SmoothCameraManager:
                 })
 
             self.latest_boxes = boxes_data
+            process_rules(self.stream_id, boxes_data)  # tags violation/emergency boxes with episode_status
+
             latest_detections[self.stream_id] = [
-                {"class_name": d["class_name"], "confidence": d["confidence"], "track_id": d["track_id"]}
+                {
+                    "class_name": d["class_name"],
+                    "confidence": d["confidence"],
+                    "track_id": d["track_id"],
+                    "episode_status": d.get("episode_status"),
+                }
                 for d in boxes_data
             ]
 
-            process_rules(self.stream_id, boxes_data)
             time.sleep(0.02)
 
     def render_loop(self):
@@ -479,6 +562,70 @@ class SmoothCameraManager:
 
 
 cameras = {stream_id: SmoothCameraManager(src, stream_id) for stream_id, src in STREAM_SOURCES.items()}
+
+
+# ---------------------------------------------------------------------------
+# Action helpers — single source of truth shared by REST routes AND the AI Agent's
+# confirmed actions, so both paths behave identically and validate the same way.
+# ---------------------------------------------------------------------------
+def apply_model(model_id):
+    global active_model_id
+    if model_id not in MODEL_REGISTRY:
+        return {"status": "error", "message": "unknown model"}
+    path = MODEL_REGISTRY[model_id]["path"]
+    for cam in cameras.values():
+        cam.switch_model(path)
+    active_model_id = model_id
+    return {"status": "success", "active": active_model_id}
+
+
+def apply_confidence(value):
+    global active_confidence
+    active_confidence = max(0.1, min(0.95, float(value)))
+    return {"status": "success", "confidence": active_confidence}
+
+
+def apply_zone_rules(stream_id, required=None, emergency=None):
+    if stream_id not in ZONE_RULES:
+        return {"status": "error", "message": "unknown zone"}
+    if required is not None:
+        ZONE_RULES[stream_id]["required"] = [p for p in required if p in PPE_TO_VIOLATION]
+    if emergency is not None:
+        ZONE_RULES[stream_id]["emergency"] = [c for c in emergency if c in EMERGENCY_CLASSES]
+    return {
+        "status": "success",
+        "stream_id": stream_id,
+        "required": ZONE_RULES[stream_id]["required"],
+        "emergency": ZONE_RULES[stream_id].get("emergency", []),
+    }
+
+
+def apply_context_visibility(class_name, visible):
+    if class_name not in CONTEXT_CLASSES:
+        return {"status": "error", "message": "unknown class"}
+    with context_lock:
+        context_visibility[class_name] = bool(visible)
+    return {"status": "success", "class": class_name, "visible": bool(visible)}
+
+
+def apply_pause(stream_id, paused):
+    cam = cameras.get(stream_id)
+    if not cam:
+        return {"status": "error", "message": "unknown stream"}
+    cam.set_paused(bool(paused))
+    return {"status": "success", "stream_id": stream_id, "paused": cam.paused}
+
+
+def apply_source(stream_id, token):
+    cam = cameras.get(stream_id)
+    if not cam:
+        return {"status": "error", "message": "unknown stream"}
+    resolved, err = resolve_source(token)
+    if err:
+        return {"status": "error", "message": err}
+    cam.switch_source(resolved)
+    stream_source_tokens[stream_id] = "Webcam" if resolved == 0 else token
+    return {"status": "success", "stream_id": stream_id, "source": stream_source_tokens[stream_id]}
 
 
 # ---------------------------------------------------------------------------
@@ -546,14 +693,7 @@ class ModelSelect(BaseModel):
 
 @app.post("/api/model/select")
 def select_model(req: ModelSelect):
-    global active_model_id
-    if req.id not in MODEL_REGISTRY:
-        return {"status": "error", "message": "unknown model"}
-    path = MODEL_REGISTRY[req.id]["path"]
-    for cam in cameras.values():
-        cam.switch_model(path)
-    active_model_id = req.id
-    return {"status": "success", "active": active_model_id}
+    return apply_model(req.id)
 
 
 class ConfidenceSet(BaseModel):
@@ -562,9 +702,7 @@ class ConfidenceSet(BaseModel):
 
 @app.post("/api/config/confidence")
 def set_confidence(req: ConfidenceSet):
-    global active_confidence
-    active_confidence = max(0.1, min(0.95, req.confidence))
-    return {"status": "success", "confidence": active_confidence}
+    return apply_confidence(req.confidence)
 
 
 # ---------------------------------------------------------------------------
@@ -594,18 +732,7 @@ class ZoneUpdate(BaseModel):
 
 @app.post("/api/zones/{stream_id}")
 def update_zone(stream_id: str, req: ZoneUpdate):
-    if stream_id not in ZONE_RULES:
-        return {"status": "error", "message": "unknown zone"}
-    if req.required is not None:
-        ZONE_RULES[stream_id]["required"] = [p for p in req.required if p in PPE_TO_VIOLATION]
-    if req.emergency is not None:
-        ZONE_RULES[stream_id]["emergency"] = [c for c in req.emergency if c in EMERGENCY_CLASSES]
-    return {
-        "status": "success",
-        "stream_id": stream_id,
-        "required": ZONE_RULES[stream_id]["required"],
-        "emergency": ZONE_RULES[stream_id].get("emergency", []),
-    }
+    return apply_zone_rules(stream_id, req.required, req.emergency)
 
 
 # ---------------------------------------------------------------------------
@@ -622,11 +749,7 @@ class ContextVisibilitySet(BaseModel):
 
 @app.post("/api/context-classes/{class_name}")
 def set_context_visibility(class_name: str, req: ContextVisibilitySet):
-    if class_name not in CONTEXT_CLASSES:
-        return {"status": "error", "message": "unknown class"}
-    with context_lock:
-        context_visibility[class_name] = req.visible
-    return {"status": "success", "class": class_name, "visible": req.visible}
+    return apply_context_visibility(class_name, req.visible)
 
 
 # ---------------------------------------------------------------------------
@@ -662,15 +785,7 @@ class SourceSet(BaseModel):
 
 @app.post("/api/stream/{stream_id}/source")
 def set_source(stream_id: str, req: SourceSet):
-    cam = cameras.get(stream_id)
-    if not cam:
-        return {"status": "error", "message": "unknown stream"}
-    resolved, err = resolve_source(req.source)
-    if err:
-        return {"status": "error", "message": err}
-    cam.switch_source(resolved)
-    stream_source_tokens[stream_id] = "Webcam" if resolved == 0 else req.source
-    return {"status": "success", "stream_id": stream_id, "source": stream_source_tokens[stream_id]}
+    return apply_source(stream_id, req.source)
 
 
 class PauseSet(BaseModel):
@@ -679,11 +794,283 @@ class PauseSet(BaseModel):
 
 @app.post("/api/stream/{stream_id}/pause")
 def set_pause(stream_id: str, req: PauseSet):
-    cam = cameras.get(stream_id)
-    if not cam:
-        return {"status": "error", "message": "unknown stream"}
-    cam.set_paused(req.paused)
-    return {"status": "success", "stream_id": stream_id, "paused": cam.paused}
+    return apply_pause(stream_id, req.paused)
+
+
+# ---------------------------------------------------------------------------
+# AI Agent — conversational assistant with tool calling (Gemini function calling).
+# READ tools run inline (safe). ACTION tools are NOT run here — they're returned to
+# the UI as a pending action that a human confirms, then executed via /api/agent/execute.
+# ---------------------------------------------------------------------------
+def _agent_get_events(zone="", violation_class="", event_type="", since_minutes=0):
+    with engine_lock:
+        result = list(events)
+    if zone:
+        z = str(zone).lower()
+        result = [e for e in result if z in e["zone"].lower() or z in e["stream_id"].lower()]
+    if violation_class:
+        vc = str(violation_class).lower()
+        result = [e for e in result if vc in e["class"].lower()]
+    if event_type:
+        et = str(event_type).upper()
+        result = [e for e in result if e["type"] == et]
+    try:
+        since_minutes = int(since_minutes or 0)
+    except (TypeError, ValueError):
+        since_minutes = 0
+    if since_minutes > 0:
+        cutoff = time.time() * 1000 - since_minutes * 60_000
+        result = [e for e in result if e.get("ts_ms", 0) >= cutoff]
+    return {"count": len(result), "events": result[:50]}
+
+
+def _agent_get_notifications():
+    with engine_lock:
+        return {"count": len(notifications), "notifications": list(notifications)[:50]}
+
+
+def _agent_get_zone_config():
+    return get_zones()
+
+
+def _agent_get_stream_status():
+    return get_sources()
+
+
+def _agent_get_system_config():
+    return {
+        "active_model": active_model_id,
+        "confidence": active_confidence,
+        "context_visible": dict(context_visibility),
+    }
+
+
+def _agent_send_telegram(text):
+    ok = send_telegram(str(text))
+    return {
+        "status": "success" if ok else "error",
+        "sent": ok,
+        "message": "Terkirim ke Telegram." if ok else "Gagal kirim — cek TELEGRAM_BOT_TOKEN/CHAT_ID di .env.",
+    }
+
+
+READ_TOOLS = {
+    "get_events": _agent_get_events,
+    "get_notifications": _agent_get_notifications,
+    "get_zone_config": _agent_get_zone_config,
+    "get_stream_status": _agent_get_stream_status,
+    "get_system_config": _agent_get_system_config,
+}
+
+ACTION_TOOLS = {
+    "send_telegram_message": lambda text: _agent_send_telegram(text),
+    "set_zone_rules": lambda stream_id, required=None, emergency=None: apply_zone_rules(stream_id, required, emergency),
+    "set_confidence": lambda confidence: apply_confidence(confidence),
+    "set_stream_paused": lambda stream_id, paused: apply_pause(stream_id, paused),
+    "select_model": lambda model_id: apply_model(model_id),
+    "set_context_visibility": lambda class_name, visible: apply_context_visibility(class_name, visible),
+}
+
+AGENT_FUNCTION_DECLARATIONS = [
+    {
+        "name": "get_events",
+        "description": "Ambil daftar event pelanggaran APD / darurat yang tercatat sistem. Bisa difilter.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "zone": {"type": "STRING", "description": "Filter nama zona atau stream_id, mis. 'Welding' atau 'stream_02'. Kosongkan untuk semua."},
+            "violation_class": {"type": "STRING", "description": "Filter kelas, mis. 'NO-Mask', 'Fire'. Kosongkan untuk semua."},
+            "event_type": {"type": "STRING", "description": "'VIOLATION' atau 'EMERGENCY'. Kosongkan untuk semua."},
+            "since_minutes": {"type": "INTEGER", "description": "Hanya event dalam N menit terakhir. 0 = semua."},
+        }},
+    },
+    {"name": "get_notifications", "description": "Ambil log aktivitas notifikasi yang sudah dikirim AI Agent.",
+     "parameters": {"type": "OBJECT", "properties": {}}},
+    {"name": "get_zone_config", "description": "Ambil konfigurasi aturan tiap zona: PPE wajib dan kelas darurat yang aktif.",
+     "parameters": {"type": "OBJECT", "properties": {}}},
+    {"name": "get_stream_status", "description": "Ambil status tiap stream/kamera: sumber (video/webcam) dan apakah sedang di-pause.",
+     "parameters": {"type": "OBJECT", "properties": {}}},
+    {"name": "get_system_config", "description": "Ambil konfigurasi sistem: model deteksi aktif, confidence threshold, visibilitas kelas konteks.",
+     "parameters": {"type": "OBJECT", "properties": {}}},
+    {
+        "name": "send_telegram_message",
+        "description": "Kirim pesan/laporan ke grup safety via Telegram. Susun teksnya sendiri berdasarkan data.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "text": {"type": "STRING", "description": "Isi pesan yang akan dikirim."},
+        }, "required": ["text"]},
+    },
+    {
+        "name": "set_zone_rules",
+        "description": "Ubah aturan sebuah zona. stream_01=Assembly Line A, stream_02=Welding Bay B.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "stream_id": {"type": "STRING", "description": "'stream_01' atau 'stream_02'."},
+            "required": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Daftar PPE wajib: Hardhat, Mask, Safety Vest. Hilangkan bila tak diubah."},
+            "emergency": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Daftar kelas darurat aktif: Fire, Smoke. Hilangkan bila tak diubah."},
+        }, "required": ["stream_id"]},
+    },
+    {
+        "name": "set_confidence",
+        "description": "Ubah confidence threshold deteksi (0.1 - 0.95).",
+        "parameters": {"type": "OBJECT", "properties": {
+            "confidence": {"type": "NUMBER", "description": "Nilai 0.1 sampai 0.95, mis. 0.7 untuk 70%."},
+        }, "required": ["confidence"]},
+    },
+    {
+        "name": "set_stream_paused",
+        "description": "Pause atau resume sebuah stream/kamera.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "stream_id": {"type": "STRING", "description": "'stream_01' atau 'stream_02'."},
+            "paused": {"type": "BOOLEAN", "description": "true = pause, false = resume."},
+        }, "required": ["stream_id", "paused"]},
+    },
+    {
+        "name": "select_model",
+        "description": "Ganti model deteksi YOLO.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "model_id": {"type": "STRING", "description": "'yolov11m' atau 'yolo26m'."},
+        }, "required": ["model_id"]},
+    },
+    {
+        "name": "set_context_visibility",
+        "description": "Tampilkan/sembunyikan kelas konteks di overlay: Person, Safety Cone, machinery, vehicle.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "class_name": {"type": "STRING", "description": "Person, Safety Cone, machinery, atau vehicle."},
+            "visible": {"type": "BOOLEAN", "description": "true = tampilkan, false = sembunyikan."},
+        }, "required": ["class_name", "visible"]},
+    },
+]
+
+AGENT_SYSTEM_PROMPT = (
+    "Kamu adalah AI Agent asisten keselamatan kerja (HSE) untuk dashboard Smart Factory. "
+    "Jawab dalam Bahasa Indonesia, ringkas dan profesional. "
+    "Selalu gunakan tools untuk mengambil data nyata sebelum menjawab pertanyaan tentang kondisi/insiden — "
+    "jangan mengarang angka. "
+    "Untuk permintaan yang mengubah sistem atau mengirim pesan, panggil function aksi yang sesuai satu kali; "
+    "sistem akan meminta konfirmasi manusia sebelum benar-benar menjalankannya, jadi kamu tidak perlu meminta izin lagi. "
+    "Konteks: stream_01 = Assembly Line A, stream_02 = Welding Bay B. "
+    "Kelas pelanggaran APD: NO-Hardhat, NO-Mask, NO-Safety Vest. Kelas darurat: Fire, Smoke."
+)
+
+
+def describe_action(name, args):
+    if name == "send_telegram_message":
+        return f'Kirim pesan ke Telegram:\n"{args.get("text", "")}"'
+    if name == "set_zone_rules":
+        parts = []
+        if args.get("required") is not None:
+            parts.append(f"PPE wajib = {args.get('required')}")
+        if args.get("emergency") is not None:
+            parts.append(f"deteksi darurat = {args.get('emergency')}")
+        return f"Ubah aturan zona {args.get('stream_id')}: " + (", ".join(parts) if parts else "(tidak ada perubahan)")
+    if name == "set_confidence":
+        try:
+            pct = round(float(args.get("confidence", 0)) * 100)
+        except (TypeError, ValueError):
+            pct = args.get("confidence")
+        return f"Ubah confidence threshold ke {pct}%"
+    if name == "set_stream_paused":
+        return f"{'Pause' if args.get('paused') else 'Resume'} stream {args.get('stream_id')}"
+    if name == "select_model":
+        return f"Ganti model deteksi ke {args.get('model_id')}"
+    if name == "set_context_visibility":
+        return f"{'Tampilkan' if args.get('visible') else 'Sembunyikan'} kelas '{args.get('class_name')}' di layar"
+    return name
+
+
+def run_agent_chat(history):
+    if not GEMINI_API_KEY:
+        return {
+            "configured": False,
+            "reply": "AI Agent belum aktif. Isi GEMINI_API_KEY di file .env untuk mengaktifkan chat.",
+            "pending_action": None,
+        }
+
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    tool = types.Tool(function_declarations=AGENT_FUNCTION_DECLARATIONS)
+    config = types.GenerateContentConfig(
+        system_instruction=AGENT_SYSTEM_PROMPT,
+        tools=[tool],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+    contents = []
+    for m in history:
+        role = "user" if m.get("role") == "user" else "model"
+        text = m.get("text", "")
+        if text:
+            contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
+
+    try:
+        for _ in range(6):  # bounded tool-calling loop
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
+            calls = list(resp.function_calls or [])
+
+            action_call = next((c for c in calls if c.name in ACTION_TOOLS), None)
+            if action_call is not None:
+                args = dict(action_call.args or {})
+                return {
+                    "configured": True,
+                    "reply": (resp.text or "").strip(),
+                    "pending_action": {
+                        "tool": action_call.name,
+                        "args": args,
+                        "description": describe_action(action_call.name, args),
+                    },
+                }
+
+            if calls:  # all read tools -> execute, feed back, continue the loop
+                contents.append(resp.candidates[0].content)
+                parts = []
+                for c in calls:
+                    fn = READ_TOOLS.get(c.name)
+                    result = fn(**dict(c.args or {})) if fn else {"error": "unknown tool"}
+                    parts.append(types.Part.from_function_response(name=c.name, response={"result": result}))
+                contents.append(types.Content(role="user", parts=parts))
+                continue
+
+            return {"configured": True, "reply": (resp.text or "").strip(), "pending_action": None}
+
+        return {"configured": True, "reply": "Maaf, langkahnya terlalu panjang. Coba pertanyaan yang lebih spesifik.", "pending_action": None}
+    except Exception as e:
+        print(f"[AI AGENT] chat error: {e}")
+        return {"configured": True, "reply": f"Terjadi kendala saat memproses permintaan: {e}", "pending_action": None, "error": True}
+
+
+@app.get("/api/agent/status")
+def agent_status():
+    return {"configured": bool(GEMINI_API_KEY), "telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}
+
+
+class AgentMessage(BaseModel):
+    role: str
+    text: str
+
+
+class AgentChatRequest(BaseModel):
+    messages: list[AgentMessage]
+
+
+@app.post("/api/agent/chat")
+def agent_chat(req: AgentChatRequest):
+    history = [{"role": m.role, "text": m.text} for m in req.messages]
+    return run_agent_chat(history)
+
+
+class AgentExecuteRequest(BaseModel):
+    tool: str
+    args: dict = {}
+
+
+@app.post("/api/agent/execute")
+def agent_execute(req: AgentExecuteRequest):
+    if req.tool not in ACTION_TOOLS:
+        return {"status": "error", "message": "Aksi tidak dikenal atau tidak diizinkan."}
+    try:
+        result = ACTION_TOOLS[req.tool](**req.args)
+    except TypeError as e:
+        return {"status": "error", "message": f"Argumen tidak valid: {e}"}
+    return {"status": "success", "tool": req.tool, "result": result}
 
 
 if __name__ == "__main__":

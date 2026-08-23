@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Camera, ShieldAlert, CheckCircle, XCircle, MapPin, AlertTriangle,
-  Video, Flame, Bot, ScanLine, Pause, Play,
+  Video, Flame, Bot, ScanLine, Pause, Play, Clock, CheckCheck, Info,
 } from 'lucide-react';
 
 const API_BASE = 'http://127.0.0.1:8000';
@@ -21,14 +21,18 @@ function labelTone(label) {
   return 'text-emerald-400 border-emerald-800/40 bg-emerald-950/30';
 }
 
-export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents, verifiedIncidents = [], setVerifiedIncidents }) {
+export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents, verifiedIncidents = [], setVerifiedIncidents, seenEventIdsRef }) {
   const [activeStream, setActiveStream] = useState('stream_01');
   const [allDetections, setAllDetections] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [emergencyActive, setEmergencyActive] = useState(false);
   const [paused, setPaused] = useState(false);
 
-  const seenEventIds = useRef(new Set());
+  // Lifted to App.jsx so it survives this component unmounting on page navigation —
+  // otherwise already dismissed/confirmed events would reappear on remount. Falls back
+  // to a local ref only if the caller doesn't pass one in.
+  const localSeenEventIds = useRef(new Set());
+  const seenEventIds = seenEventIdsRef ?? localSeenEventIds;
   const audioCtxRef = useRef(null);
   const lastBeepRef = useRef(0);
 
@@ -149,8 +153,10 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
   const breakdown = Object.values(
     allDetections.reduce((acc, d) => {
       const name = d.class_name || d.label;
-      if (!acc[name]) acc[name] = { name, label: d.label, count: 0 };
+      if (!acc[name]) acc[name] = { name, label: d.label, count: 0, pending: 0, notified: 0 };
       acc[name].count += 1;
+      if (d.episode_status === 'pending') acc[name].pending += 1;
+      else if (d.episode_status === 'notified') acc[name].notified += 1;
       return acc;
     }, {})
   ).sort((a, b) => b.count - a.count);
@@ -242,9 +248,14 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
         </div>
 
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 shadow-xl">
-          <h2 className="text-sm font-semibold flex items-center gap-2 mb-3 text-slate-200">
-            <ScanLine size={16} className="text-blue-400" /> Live Detection Breakdown // {activeStream.toUpperCase()}
-          </h2>
+          <div className="flex items-center justify-between mb-1">
+            <h2 className="text-sm font-semibold flex items-center gap-2 text-slate-200">
+              <ScanLine size={16} className="text-blue-400" /> Live Detection Breakdown // {activeStream.toUpperCase()}
+            </h2>
+          </div>
+          <p className="text-[10px] text-slate-500 mb-3 flex items-center gap-1">
+            <Info size={11} /> <Clock size={10} className="text-amber-300" /> menunggu konfirmasi &nbsp;·&nbsp; <CheckCheck size={10} /> sudah dinotifikasi (tidak akan re-alert selama masih episode yang sama)
+          </p>
           {breakdown.length === 0 ? (
             <div className="bg-slate-950 p-5 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">
               No objects currently detected on this feed.
@@ -258,6 +269,20 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
                 >
                   {d.name}
                   <span className="font-mono bg-slate-950/60 px-1.5 rounded text-[11px]">{d.count}</span>
+                  {(d.pending > 0 || d.notified > 0) && (
+                    <span className="flex items-center gap-1.5 pl-1.5 ml-0.5 border-l border-current/20 font-mono text-[10px]">
+                      {d.pending > 0 && (
+                        <span className="flex items-center gap-0.5 text-amber-300" title="Belum notif — masih dikonfirmasi (min. 5 detik)">
+                          <Clock size={10} />{d.pending}
+                        </span>
+                      )}
+                      {d.notified > 0 && (
+                        <span className="flex items-center gap-0.5 opacity-70" title="Sudah notif untuk episode ini — deteksi lanjutan di posisi ini di-skip">
+                          <CheckCheck size={10} />{d.notified}
+                        </span>
+                      )}
+                    </span>
+                  )}
                 </span>
               ))}
             </div>

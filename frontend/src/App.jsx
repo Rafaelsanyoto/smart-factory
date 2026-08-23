@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, Navigate } from 'react-router-dom';
-import { Activity, BarChart, Settings, Video, LogOut, Cpu, Wifi, WifiOff } from 'lucide-react';
+import { Activity, BarChart, Settings, Video, LogOut, Cpu, Wifi, WifiOff, Bot } from 'lucide-react';
 import LiveMonitor from './pages/LiveMonitor';
 import Analytics from './pages/Analytics';
 import Configuration from './pages/Settings';
+import AgentChat from './pages/AgentChat';
 import Login from './pages/Login';
 
 const API_BASE = 'http://127.0.0.1:8000';
@@ -30,6 +31,11 @@ export default function App() {
   // Lifted State: This memory persists even when navigating away from the Live Monitor
   const [pendingIncidents, setPendingIncidents] = useState([]);
   const [verifiedIncidents, setVerifiedIncidents] = useState([]);
+
+  // Lifted ref too: must survive LiveMonitor unmounting (page navigation), otherwise
+  // events already dismissed/confirmed re-appear in the queue on remount because the
+  // backend's /api/events history doesn't know which ones the user already handled.
+  const seenEventIdsRef = useRef(new Set());
 
   // Backend connectivity + active model, polled from the edge node
   const [backendOnline, setBackendOnline] = useState(false);
@@ -83,6 +89,7 @@ export default function App() {
           <div className="flex items-center gap-2 bg-slate-950 p-1 rounded-lg border border-slate-800">
             <NavLink to="/" icon={Video} label="Live Monitor" />
             <NavLink to="/analytics" icon={BarChart} label="Analytics" />
+            <NavLink to="/agent" icon={Bot} label="AI Agent" />
             <NavLink to="/settings" icon={Settings} label="Settings" />
           </div>
 
@@ -118,18 +125,20 @@ export default function App() {
             <Route 
               path="/" 
               element={
-                <LiveMonitor 
-                  pendingIncidents={pendingIncidents} 
+                <LiveMonitor
+                  pendingIncidents={pendingIncidents}
                   setPendingIncidents={setPendingIncidents}
                   verifiedIncidents={verifiedIncidents}
                   setVerifiedIncidents={setVerifiedIncidents}
+                  seenEventIdsRef={seenEventIdsRef}
                 />
               } 
             />
-            <Route 
-              path="/analytics" 
-              element={<Analytics verifiedIncidents={verifiedIncidents} />} 
+            <Route
+              path="/analytics"
+              element={<Analytics verifiedIncidents={verifiedIncidents} />}
             />
+            <Route path="/agent" element={<AgentChat />} />
             <Route path="/settings" element={<Configuration />} />
             <Route path="*" element={<Navigate to="/" />} />
           </Routes>
