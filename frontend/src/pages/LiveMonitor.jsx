@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Camera, ShieldAlert, CheckCircle, XCircle, MapPin, AlertTriangle,
-  Video, Flame, Bot, ScanLine, Pause, Play, Clock, CheckCheck, Info,
+  Video, Flame, Bot, ScanLine, Pause, Play, Clock, CheckCheck, Info, Send, Loader2, Trash2, Hash,
 } from 'lucide-react';
 
 const API_BASE = 'http://127.0.0.1:8000';
@@ -21,18 +21,56 @@ function labelTone(label) {
   return 'text-emerald-400 border-emerald-800/40 bg-emerald-950/30';
 }
 
-export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents, verifiedIncidents = [], setVerifiedIncidents, seenEventIdsRef }) {
+// Inline form for recording remediation on a CONFIRMED incident — completes the
+// PENDING -> CONFIRMED -> action-taken tracking cycle.
+function ActionForm({ incidentId, onSubmit }) {
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!note.trim() || busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      await onSubmit(incidentId, note.trim());
+    } catch (err) {
+      setError(err.message || 'Gagal mencatat tindakan.');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit} className="mt-2 pt-2 border-t border-slate-800 space-y-1.5">
+      <div className="flex gap-1.5">
+        <input
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          disabled={busy}
+          placeholder="Catat tindakan yang diambil…"
+          className="flex-1 bg-slate-900 border border-slate-700 text-slate-200 text-[11px] rounded-md focus:ring-blue-500 focus:border-blue-500 px-2 py-1.5 disabled:opacity-50"
+        />
+        <button
+          type="submit"
+          disabled={busy || !note.trim()}
+          className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white rounded-md flex items-center gap-1"
+        >
+          {busy ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />}
+        </button>
+      </div>
+      {error && <p className="text-[10px] text-red-400">{error}</p>}
+    </form>
+  );
+}
+
+export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents = [], refreshIncidents }) {
   const [activeStream, setActiveStream] = useState('stream_01');
   const [allDetections, setAllDetections] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [emergencyActive, setEmergencyActive] = useState(false);
   const [paused, setPaused] = useState(false);
 
-  // Lifted to App.jsx so it survives this component unmounting on page navigation —
-  // otherwise already dismissed/confirmed events would reappear on remount. Falls back
-  // to a local ref only if the caller doesn't pass one in.
-  const localSeenEventIds = useRef(new Set());
-  const seenEventIds = seenEventIdsRef ?? localSeenEventIds;
   const audioCtxRef = useRef(null);
   const lastBeepRef = useRef(0);
 
@@ -89,41 +127,21 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
     return () => clearInterval(interval);
   }, [activeStream]);
 
-  // Backend rule-engine events → verification queue (all streams, already deduped server-side)
+  // AI Agent activity log. The incident queue itself (pendingIncidents/verifiedIncidents)
+  // is now polled once at the App.jsx level from /api/events, since the backend's event
+  // `status` field is the single source of truth — see App.jsx's refreshIncidents.
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        const [evtRes, notifRes] = await Promise.all([
-          fetch(`${API_BASE}/api/events`),
-          fetch(`${API_BASE}/api/notifications`),
-        ]);
-        const evtData = await evtRes.json();
-        const notifData = await notifRes.json();
-
-        if (notifData.status === 'success') setNotifications(notifData.notifications || []);
-
-        if (evtData.status === 'success' && Array.isArray(evtData.events)) {
-          const fresh = evtData.events.filter((e) => !seenEventIds.current.has(e.id));
-          if (fresh.length > 0) {
-            fresh.forEach((e) => seenEventIds.current.add(e.id));
-            const mapped = fresh.map((e) => ({
-              id: e.id,
-              time: e.timestamp,
-              type: (e.class || '').toUpperCase(),
-              zone: e.zone,
-              eventType: e.type, // VIOLATION | EMERGENCY
-            }));
-            if (typeof setPendingIncidents === 'function') {
-              setPendingIncidents((prev) => [...mapped, ...prev].slice(0, 12));
-            }
-          }
-        }
+        const res = await fetch(`${API_BASE}/api/notifications`);
+        const data = await res.json();
+        if (data.status === 'success') setNotifications(data.notifications || []);
       } catch (err) {
-        console.error('Event polling error:', err);
+        console.error('Notification polling error:', err);
       }
     }, 1000);
     return () => clearInterval(interval);
-  }, [setPendingIncidents]);
+  }, []);
 
   const togglePause = async () => {
     const next = !paused;
@@ -139,13 +157,41 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
     }
   };
 
-  const handleVerifyIncident = (id, status) => {
-    const target = pendingIncidents.find((inc) => inc.id === id);
-    if (!target) return;
-    setPendingIncidents((prev) => prev.filter((inc) => inc.id !== id));
-    if (status === 'CONFIRMED') {
-      setVerifiedIncidents((prev) => [{ ...target, status: 'CONFIRMED' }, ...prev]);
+  const handleVerifyIncident = async (id, status) => {
+    try {
+      await fetch(`${API_BASE}/api/events/${id}/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+    } catch (err) {
+      console.error('Verify incident error:', err);
     }
+    if (typeof refreshIncidents === 'function') refreshIncidents();
+  };
+
+  const handleRecordAction = async (id, actionNote) => {
+    const res = await fetch(`${API_BASE}/api/events/${id}/action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action_note: actionNote }),
+    });
+    const data = await res.json();
+    if (typeof refreshIncidents === 'function') refreshIncidents();
+    if (data.status !== 'success') throw new Error(data.message || 'Gagal mencatat tindakan');
+  };
+
+  const handleDeleteIncident = async (id) => {
+    try {
+      await fetch(`${API_BASE}/api/events/${id}/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'Duplikat' }),
+      });
+    } catch (err) {
+      console.error('Delete incident error:', err);
+    }
+    if (typeof refreshIncidents === 'function') refreshIncidents();
   };
 
   // Derived views
@@ -305,7 +351,7 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
                 return (
                   <div key={incident.id} className={`bg-slate-950 border p-3.5 rounded-lg space-y-2.5 ${isEmergency ? 'border-orange-500/40' : 'border-amber-500/30'}`}>
                     <div className="flex justify-between items-center text-xs">
-                      <span className="font-mono text-slate-400">{incident.time}</span>
+                      <span className="font-mono text-slate-500 flex items-center gap-1"><Hash size={10} />{incident.seq ?? '?'} · {incident.time}</span>
                       <span className={`font-bold px-2 py-0.5 rounded border flex items-center gap-1 ${
                         isEmergency ? 'text-orange-300 bg-orange-950/50 border-orange-800/40' : 'text-red-400 bg-red-950/50 border-red-800/40'
                       }`}>
@@ -314,7 +360,8 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
                     </div>
                     <div className="flex justify-between items-center pt-1">
                       <span className="text-[11px] text-slate-300 flex items-center gap-1"><MapPin size={12} /> {incident.zone}</span>
-                      <div className="flex gap-2">
+                      <div className="flex gap-1.5">
+                        <button onClick={() => handleDeleteIncident(incident.id)} title="Hapus (duplikat)" className="px-2 py-1 bg-slate-800 hover:bg-red-950/60 text-slate-500 hover:text-red-400 rounded text-xs flex items-center"><Trash2 size={13} /></button>
                         <button onClick={() => handleVerifyIncident(incident.id, 'DISMISSED')} className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs flex items-center gap-1"><XCircle size={14} /> Dismiss</button>
                         <button onClick={() => handleVerifyIncident(incident.id, 'CONFIRMED')} className="px-2.5 py-1 bg-red-600 hover:bg-red-500 text-white rounded text-xs flex items-center gap-1 font-semibold"><CheckCircle size={14} /> Confirm</button>
                       </div>
@@ -344,7 +391,7 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
                         ? 'text-emerald-400 border-emerald-800/50 bg-emerald-950/30'
                         : 'text-slate-500 border-slate-800 bg-slate-900'
                     }`}>
-                      {n.dispatched ? 'SENT · TELEGRAM' : 'LOCAL ONLY'}
+                      {n.dispatched ? `SENT · ${(n.channel || 'EXTERNAL').toUpperCase()}` : 'LOCAL ONLY'}
                     </span>
                   </div>
                   <p className="text-slate-300 leading-snug">{n.message}</p>
@@ -356,14 +403,37 @@ export default function LiveMonitor({ pendingIncidents = [], setPendingIncidents
 
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 shadow-xl">
           <h2 className="text-sm font-semibold flex items-center gap-2 mb-3 text-red-400"><ShieldAlert size={16} /> Confirmed Incident Registry</h2>
-          <div className="space-y-2.5 max-h-[220px] overflow-y-auto pr-1">
+          <div className="space-y-2.5 max-h-[320px] overflow-y-auto pr-1">
             {verifiedIncidents.length === 0 ? (
               <div className="bg-slate-950 p-5 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">No confirmed incidents yet.</div>
             ) : (
-              verifiedIncidents.map((log, index) => (
-                <div key={index} className="bg-slate-950 border border-slate-800 p-3 rounded-lg flex justify-between items-center text-xs">
-                  <div><span className="font-bold text-red-400 block">{log.type}</span><span className="text-slate-500 font-mono text-[10px]">{log.time}</span></div>
-                  <span className="text-slate-300 bg-slate-900 px-2 py-1 rounded border border-slate-800 text-[11px]">{log.zone}</span>
+              verifiedIncidents.map((log) => (
+                <div key={log.id} className="bg-slate-950 border border-slate-800 p-3 rounded-lg text-xs">
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <span className="font-bold text-red-400 block">{log.type}</span>
+                      <span className="text-slate-500 font-mono text-[10px] flex items-center gap-1"><Hash size={9} />{log.seq ?? '?'} · {log.time}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-slate-300 bg-slate-900 px-2 py-1 rounded border border-slate-800 text-[11px]">{log.zone}</span>
+                      {!log.actionTaken && (
+                        <button onClick={() => handleDeleteIncident(log.id)} title="Hapus (duplikat)" className="p-1.5 bg-slate-900 hover:bg-red-950/60 text-slate-500 hover:text-red-400 rounded border border-slate-800">
+                          <Trash2 size={12} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {log.actionTaken ? (
+                    <div className="mt-2 pt-2 border-t border-slate-800">
+                      <span className="text-emerald-400 font-semibold flex items-center gap-1 text-[11px]">
+                        <CheckCheck size={11} /> Sudah ditindak · {log.actionAt}
+                      </span>
+                      <p className="text-slate-300 mt-1 leading-snug">{log.actionNote}</p>
+                    </div>
+                  ) : (
+                    <ActionForm incidentId={log.id} onSubmit={handleRecordAction} />
+                  )}
                 </div>
               ))
             )}

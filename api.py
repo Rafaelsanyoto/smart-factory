@@ -1,10 +1,21 @@
 import asyncio
 import json
 import os
+import sys
 import time
 import threading
 import urllib.request
 import uuid
+
+# Windows defaults stdout/stderr to the system codepage (cp1252 here), which raises
+# UnicodeEncodeError and crashes the process on any print() containing an emoji or other
+# non-cp1252 character — e.g. the 🚨/⚠️ notification icons, or unicode text a future Gemini
+# response might contain. Force UTF-8 so that class of crash can't happen. Only console
+# streams support reconfigure (redirected-to-file streams from `run_in_background` do
+# too, but guard anyway in case stdout has been replaced by something that doesn't).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 import cv2
 from fastapi import FastAPI, Request
@@ -53,17 +64,24 @@ MODEL_REGISTRY = {
     "yolov11m": {"label": "YOLOv11m", "path": os.path.join(MODEL_DIR, "yolo v11.pt")},
     "yolo26m": {"label": "YOLO26m", "path": os.path.join(MODEL_DIR, "yolo v26.pt")},
 }
-DEFAULT_MODEL = "yolov11m"
+DEFAULT_MODEL = "yolo26m"
 
 # Global runtime state (guarded where written from request threads)
 active_model_id = DEFAULT_MODEL
 active_confidence = 0.25
 
-# --- AI Agent: message wording via Gemini (free tier), dispatch via Telegram ---------
-# Both are optional. If unset, notify_safety() falls back to a fixed template and skips
+# --- AI Agent: message wording via Gemini (free tier), dispatch to a notify channel ----
+# All optional. If unset, notify_safety() falls back to fixed template text and skips
 # external dispatch — the app runs fine without any of this configured.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
+# Notification channel — Discord webhook (simplest: one URL, no bot). Telegram kept as a
+# fallback option. dispatch_message() prefers Discord when both are set.
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+# Optional SECOND Discord channel, just for "action taken" updates — lets you split new
+# detections from remediation follow-ups into two channels. Falls back to the main
+# channel above if left unset.
+DISCORD_WEBHOOK_URL_ACTIONS = os.environ.get("DISCORD_WEBHOOK_URL_ACTIONS", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -187,6 +205,11 @@ MATCH_IOU_THRESHOLD = 0.2
 MAX_EVENTS = 100
 MAX_NOTIFICATIONS = 100
 
+# Human-referenceable incident number (#1, #2, ...) — the UUID `id` is still the real key
+# used everywhere internally/in the API, this is purely a readable label for the UI and
+# for admins/the AI Agent to unambiguously refer to "insiden #N" in conversation.
+_event_seq_counter = 0
+
 
 def _iou(box_a, box_b):
     """Intersection-over-union of two [x1,y1,x2,y2] boxes."""
@@ -205,56 +228,122 @@ def _iou(box_a, box_b):
 latest_detections = {"stream_01": [], "stream_02": []}
 
 
-def build_fallback_message(event):
-    """Fixed-template message — used immediately, and whenever Gemini is unavailable."""
-    if event["type"] == "EMERGENCY":
-        msg = (
-            f"EMERGENCY — {event['class']} detected at {event['zone']}. "
-            f"Escalating to safety division immediately."
-        )
-        return msg, "critical"
-    msg = (
-        f"PPE violation ({event['class']}) at {event['zone']}. "
-        f"Notifying safety division for review."
-    )
-    return msg, "warning"
+def _pct(confidence):
+    return f"{round(confidence * 100)}%" if isinstance(confidence, (int, float)) else "—"
 
 
-def generate_notification_text(event):
-    """Ask Gemini to phrase the notification. Returns None on missing key/any failure."""
-    if not GEMINI_API_KEY:
-        return None
-    prompt = (
-        "Kamu adalah AI Agent keselamatan kerja (HSE) di sebuah pabrik. Tulis SATU "
-        "notifikasi singkat (maksimal 2 kalimat, Bahasa Indonesia, nada profesional dan "
-        "tegas) untuk tim safety berdasarkan kejadian berikut:\n"
-        f"- Jenis kejadian: {event['type']} ({event['class']})\n"
-        f"- Zona: {event['zone']}\n"
-        f"- Waktu: {event['timestamp']}\n"
-        f"- Confidence deteksi: {event.get('confidence')}\n"
-        "Langsung tulis isi notifikasinya saja, tanpa basa-basi atau label tambahan."
+def format_notification(event):
+    """Deterministic, consistently-formatted notification for a single event — same
+    structure every time (bold labels + bullet points), no LLM involved so wording never
+    varies from one violation to the next.
+    """
+    is_emergency = event["type"] == "EMERGENCY"
+    icon = "🚨" if is_emergency else "⚠️"
+    header = "DARURAT TERDETEKSI" if is_emergency else "PELANGGARAN APD TERDETEKSI"
+    action = "Segera evakuasi & hubungi tim darurat" if is_emergency else "Menunggu tindakan tim safety"
+    severity = "critical" if is_emergency else "warning"
+
+    lines = [
+        f"{icon} **{header}**",
+        f"• **Insiden:** #{event.get('seq', '?')}",
+        f"• **Zona:** {event['zone']}",
+        f"• **Jenis:** {event['class']}",
+        f"• **Waktu:** {event['timestamp']}",
+        f"• **Confidence:** {_pct(event.get('confidence'))}",
+        f"• **Status:** {action}",
+    ]
+    return "\n".join(lines), severity
+
+
+def format_batch_notification(batch_events):
+    """Deterministic notification covering multiple events that fired close together in
+    time — grouped by zone, same bold+bullet structure as the single-event format. This
+    is what keeps a burst of near-simultaneous violations to a single external message
+    instead of one each.
+    """
+    has_emergency = any(e["type"] == "EMERGENCY" for e in batch_events)
+    icon = "🚨" if has_emergency else "⚠️"
+    header = f"{len(batch_events)} KEJADIAN TERDETEKSI BERSAMAAN"
+    action = "Segera evakuasi & hubungi tim darurat" if has_emergency else "Menunggu tindakan tim safety"
+
+    by_zone = {}
+    for e in batch_events:
+        by_zone.setdefault(e["zone"], []).append(e)
+
+    seq_list = ", ".join(f"#{e.get('seq', '?')}" for e in batch_events)
+    lines = [f"{icon} **{header}**", f"• **Insiden:** {seq_list}"]
+    for zone, evs in by_zone.items():
+        items = ", ".join(f"{e['class']} (#{e.get('seq', '?')}, {_pct(e.get('confidence'))})" for e in evs)
+        lines.append(f"• **{zone}:** {items}")
+    lines.append(f"• **Waktu:** {batch_events[0]['timestamp']}")
+    lines.append(f"• **Status:** {action}")
+    return "\n".join(lines), ("critical" if has_emergency else "warning")
+
+
+def format_action_notification(event):
+    """Deterministic notification sent when an admin records the remediation taken on a
+    CONFIRMED incident — same bold+bullet structure, routed to the 'action' channel."""
+    lines = [
+        "✅ **TINDAKAN DICATAT**",
+        f"• **Insiden:** #{event.get('seq', '?')}",
+        f"• **Zona:** {event['zone']}",
+        f"• **Jenis Pelanggaran:** {event['class']}",
+        f"• **Waktu Kejadian:** {event['timestamp']}",
+        f"• **Tindakan:** {event['action_note']}",
+        f"• **Dicatat Pukul:** {event['action_at']}",
+    ]
+    return "\n".join(lines)
+
+
+def format_delete_notification(event):
+    """Deterministic notification sent when an admin deletes an incident (typically a
+    duplicate) — this is still logged as the incident's final outcome, not a silent
+    removal, so the audit trail stays one-violation-one-outcome. Routed to the 'action'
+    channel alongside remediation updates."""
+    lines = [
+        "🗑️ **INSIDEN DIHAPUS**",
+        f"• **Insiden:** #{event.get('seq', '?')}",
+        f"• **Zona:** {event['zone']}",
+        f"• **Jenis Pelanggaran:** {event['class']}",
+        f"• **Waktu Kejadian:** {event['timestamp']}",
+        f"• **Alasan:** {event['delete_reason']}",
+        f"• **Dihapus Pukul:** {event['deleted_at']}",
+    ]
+    return "\n".join(lines)
+
+
+def send_discord(text, webhook_url):
+    """Dispatch a message to a specific Discord webhook. Returns True on confirmed delivery."""
+    if not webhook_url:
+        return False
+    body = json.dumps({"content": str(text)[:1900]}).encode()  # Discord caps at 2000 chars
+    # A User-Agent header is required — Discord's Cloudflare front rejects the default
+    # urllib agent ("Python-urllib/x.y") with 403 Forbidden.
+    req = urllib.request.Request(
+        webhook_url,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "SmartFactoryHSE/1.0"},
     )
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:"
-        f"generateContent?key={GEMINI_API_KEY}"
-    )
-    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=6) as resp:
-            data = json.loads(resp.read())
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return resp.status in (200, 204)
     except Exception as e:
-        print(f"[AI AGENT] Gemini generation failed: {e}")
-        return None
+        print(f"[AI AGENT] Discord send failed: {e}")
+        return False
 
 
 def send_telegram(text):
-    """Dispatch a message via a Telegram bot. Returns True on confirmed delivery."""
+    """Dispatch a message via a Telegram bot. Returns True on confirmed delivery.
+
+    Our templates use Discord/CommonMark-style **bold**. Telegram's legacy Markdown
+    parse mode uses single-asterisk *bold* instead, so it's converted here — otherwise
+    Telegram would show the literal "**" characters instead of rendering bold text.
+    """
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return False
+    telegram_text = text.replace("**", "*")
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    body = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+    body = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": telegram_text, "parse_mode": "Markdown"}).encode()
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=6) as resp:
@@ -264,32 +353,84 @@ def send_telegram(text):
         return False
 
 
-def _dispatch_notification(event, note):
-    """Background work: refine wording via Gemini, then send via Telegram.
+def configured_channel(purpose="detection"):
+    """Which external notify channel is active for a given purpose, or None.
 
-    Runs off the hot path (ai_loop) so a slow/unavailable network never affects
-    detection throughput. Mutates `note` in place — safe even if it has since been
-    trimmed out of the `notifications` list.
+    purpose: "detection" (new events) or "action" (remediation updates — routed to the
+    second Discord channel if configured, otherwise falls back to the main one).
     """
-    generated = generate_notification_text(event)
-    text = generated or note["message"]
-    sent = send_telegram(text)
+    if purpose == "action" and DISCORD_WEBHOOK_URL_ACTIONS:
+        return "discord"
+    if DISCORD_WEBHOOK_URL:
+        return "discord"
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        return "telegram"
+    return None
+
+
+def dispatch_message(text, purpose="detection"):
+    """Send to whichever external channel is configured for this purpose. Returns
+    (sent, channel)."""
+    if purpose == "action" and DISCORD_WEBHOOK_URL_ACTIONS:
+        return send_discord(text, DISCORD_WEBHOOK_URL_ACTIONS), "discord"
+    channel = configured_channel(purpose)
+    if channel == "discord":
+        return send_discord(text, DISCORD_WEBHOOK_URL), "discord"
+    if channel == "telegram":
+        return send_telegram(text), "telegram"
+    return False, None
+
+
+# Batching: events that fire within this window of the FIRST one in a batch are combined
+# into a single external message instead of one each — a burst of 3 near-simultaneous
+# violations sends 1 Discord/Telegram message, not 3.
+BATCH_WINDOW_SECONDS = 2.0
+_batch_lock = threading.Lock()
+_batch_pending = []   # list of (event, note) accumulated in the current window
+_batch_timer = None
+
+
+def _flush_batch():
+    """Runs once, ~BATCH_WINDOW_SECONDS after the first event of a batch arrived."""
+    global _batch_timer
+    with _batch_lock:
+        batch = _batch_pending[:]
+        _batch_pending.clear()
+        _batch_timer = None
+
+    if not batch:
+        return
+
+    batch_events = [e for e, _ in batch]
+    batch_notes = [n for _, n in batch]
+
+    if len(batch_events) == 1:
+        text, _ = format_notification(batch_events[0])
+    else:
+        text, _ = format_batch_notification(batch_events)
+
+    sent, channel = dispatch_message(text)
+
     with engine_lock:
-        note["message"] = text
-        note["source"] = "gemini" if generated else "template"
-        note["dispatched"] = sent
+        for note in batch_notes:
+            note["message"] = text
+            note["dispatched"] = sent
+            note["channel"] = channel
+
     if sent:
-        print(f"[AI AGENT] Telegram dispatched: {text}")
+        print(f"[AI AGENT] {channel} dispatched (batch of {len(batch_events)}): {text}")
 
 
 def notify_safety(event):
     """AI Agent entry point: notifies the safety division when an event is raised.
 
-    Logs an immediate template-based notification synchronously (always available,
-    zero latency — critical for EMERGENCY events), then asynchronously upgrades the
-    wording via Gemini and attempts real delivery via Telegram if configured.
+    Builds a consistently-formatted notification immediately (deterministic — same bold
+    + bullet-point structure every time, no LLM involved so wording never varies), then
+    queues it for a debounced batch: the first event in a new window starts a
+    BATCH_WINDOW_SECONDS timer, and everything else that arrives before it fires is
+    combined into ONE external message instead of one each.
     """
-    msg, severity = build_fallback_message(event)
+    msg, severity = format_notification(event)
 
     note = {
         "id": event["id"],
@@ -297,14 +438,65 @@ def notify_safety(event):
         "message": msg,
         "severity": severity,
         "stream_id": event["stream_id"],
-        "source": "template",
         "dispatched": False,
+        "channel": None,
     }
     print(f"[AI AGENT] {msg}")
     notifications.insert(0, note)
     del notifications[MAX_NOTIFICATIONS:]
 
-    threading.Thread(target=_dispatch_notification, args=(event, note), daemon=True).start()
+    global _batch_timer
+    with _batch_lock:
+        _batch_pending.append((event, note))
+        if _batch_timer is None:
+            _batch_timer = threading.Timer(BATCH_WINDOW_SECONDS, _flush_batch)
+            _batch_timer.daemon = True
+            _batch_timer.start()
+
+
+def _log_and_dispatch_outcome(note_id, timestamp, text, severity, stream_id, log_label):
+    """Shared by notify_action_taken / notify_deleted: log immediately, dispatch to the
+    'action' channel in the background. Not part of the detection batching window — these
+    are deliberate one-off admin actions, not a burst of automatic detections."""
+    note = {
+        "id": note_id,
+        "timestamp": timestamp,
+        "message": text,
+        "severity": severity,
+        "stream_id": stream_id,
+        "dispatched": False,
+        "channel": None,
+    }
+    print(f"[AI AGENT] {text}")
+    notifications.insert(0, note)
+    del notifications[MAX_NOTIFICATIONS:]
+
+    def _send():
+        sent, channel = dispatch_message(text, purpose="action")
+        with engine_lock:
+            note["dispatched"] = sent
+            note["channel"] = channel
+        if sent:
+            print(f"[AI AGENT] {channel} dispatched ({log_label}): {text}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def notify_action_taken(event):
+    """Notification when an admin records remediation on a CONFIRMED incident."""
+    _log_and_dispatch_outcome(
+        f"{event['id']}-action", event["action_at"], format_action_notification(event),
+        "resolved", event["stream_id"], "action taken",
+    )
+
+
+def notify_deleted(event):
+    """Notification when an admin deletes an incident (e.g. a duplicate) — still logged
+    as the incident's final outcome, not a silent removal."""
+    _log_and_dispatch_outcome(
+        f"{event['id']}-deleted", event["deleted_at"], format_delete_notification(event),
+        "deleted", event["stream_id"], "incident deleted",
+    )
 
 
 def process_rules(stream_id, boxes):
@@ -366,8 +558,11 @@ def process_rules(stream_id, boxes):
 
             if not state["notified"] and (now_ms - state["first_seen_ms"]) >= CONFIRM_MS:
                 state["notified"] = True
+                global _event_seq_counter
+                _event_seq_counter += 1
                 event = {
                     "id": str(uuid.uuid4()),
+                    "seq": _event_seq_counter,  # human-referenceable incident number (#1, #2, ...)
                     "timestamp": time.strftime("%H:%M:%S"),
                     "ts_ms": now_ms,  # epoch ms, for the agent's "last N minutes" filtering
                     "stream_id": stream_id,
@@ -376,7 +571,14 @@ def process_rules(stream_id, boxes):
                     "class": cls,
                     "track_id": box.get("track_id"),
                     "confidence": box.get("confidence"),
-                    "status": "PENDING",
+                    "status": "PENDING",       # PENDING -> CONFIRMED | DISMISSED -> (or DELETED)
+                    "verified_at": None,
+                    "action_taken": False,     # remediation recorded on a CONFIRMED event
+                    "action_note": None,
+                    "action_at": None,
+                    "deleted": False,          # one violation, one final outcome: either a real
+                    "delete_reason": None,     # action above, OR deleted here as a duplicate —
+                    "deleted_at": None,        # these two are mutually exclusive.
                 }
                 events.insert(0, event)
                 del events[MAX_EVENTS:]
@@ -406,7 +608,7 @@ class SmoothCameraManager:
         self.current_frame_bytes = None   # rendered JPEG for streaming
         self.latest_boxes = []
         self.running = True
-        self.paused = False
+        self.paused = True  # start paused — nothing captured/detected until an admin resumes it
 
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         self.capture_thread.start()
@@ -761,6 +963,83 @@ def get_events():
         return {"status": "success", "events": list(events)}
 
 
+class EventVerify(BaseModel):
+    status: str  # "CONFIRMED" | "DISMISSED"
+
+
+@app.post("/api/events/{event_id}/verify")
+def verify_event(event_id: str, req: EventVerify):
+    """Admin marks a PENDING incident as a real violation (CONFIRMED) or a false
+    detection (DISMISSED). This is the step that makes the incident queryable by the AI
+    Agent and eligible to have a remediation action recorded against it."""
+    status = req.status.upper()
+    if status not in ("CONFIRMED", "DISMISSED"):
+        return {"status": "error", "message": "status harus CONFIRMED atau DISMISSED"}
+    with engine_lock:
+        event = next((e for e in events if e["id"] == event_id), None)
+        if not event:
+            return {"status": "error", "message": "event tidak ditemukan"}
+        event["status"] = status
+        event["verified_at"] = time.strftime("%H:%M:%S")
+        result = dict(event)
+    return {"status": "success", "event": result}
+
+
+class EventAction(BaseModel):
+    action_note: str
+
+
+@app.post("/api/events/{event_id}/action")
+def record_action(event_id: str, req: EventAction):
+    """Admin records what remediation was taken on a CONFIRMED incident. Completes the
+    tracking cycle: PENDING -> CONFIRMED -> action taken/note — all queryable by the
+    AI Agent, and dispatches a notification to the 'action' channel."""
+    note_text = req.action_note.strip()
+    if not note_text:
+        return {"status": "error", "message": "catatan tindakan tidak boleh kosong"}
+    with engine_lock:
+        event = next((e for e in events if e["id"] == event_id), None)
+        if not event:
+            return {"status": "error", "message": "event tidak ditemukan"}
+        if event["status"] != "CONFIRMED":
+            return {"status": "error", "message": "hanya insiden berstatus CONFIRMED yang bisa dicatat tindakannya"}
+        event["action_taken"] = True
+        event["action_note"] = note_text
+        event["action_at"] = time.strftime("%H:%M:%S")
+        result = dict(event)
+
+    notify_action_taken(result)
+    return {"status": "success", "event": result}
+
+
+class EventDelete(BaseModel):
+    reason: str = "Duplikat"
+
+
+@app.post("/api/events/{event_id}/delete")
+def delete_event(event_id: str, req: EventDelete):
+    """Admin deletes an incident — typically a duplicate (e.g. the same physical event
+    got split into two episodes). Not a silent removal: it's still logged as that
+    incident's final outcome (status DELETED + reason), so every violation ends up with
+    exactly one documented resolution — either a real action taken, or a deletion here.
+    Works from any status except an already-deleted incident."""
+    reason = (req.reason or "Duplikat").strip() or "Duplikat"
+    with engine_lock:
+        event = next((e for e in events if e["id"] == event_id), None)
+        if not event:
+            return {"status": "error", "message": "event tidak ditemukan"}
+        if event["status"] == "DELETED":
+            return {"status": "error", "message": "insiden ini sudah dihapus sebelumnya"}
+        event["status"] = "DELETED"
+        event["deleted"] = True
+        event["delete_reason"] = reason
+        event["deleted_at"] = time.strftime("%H:%M:%S")
+        result = dict(event)
+
+    notify_deleted(result)
+    return {"status": "success", "event": result}
+
+
 @app.get("/api/notifications")
 def get_notifications():
     with engine_lock:
@@ -802,7 +1081,7 @@ def set_pause(stream_id: str, req: PauseSet):
 # READ tools run inline (safe). ACTION tools are NOT run here — they're returned to
 # the UI as a pending action that a human confirms, then executed via /api/agent/execute.
 # ---------------------------------------------------------------------------
-def _agent_get_events(zone="", violation_class="", event_type="", since_minutes=0):
+def _agent_get_events(zone="", violation_class="", event_type="", since_minutes=0, status=""):
     with engine_lock:
         result = list(events)
     if zone:
@@ -814,6 +1093,9 @@ def _agent_get_events(zone="", violation_class="", event_type="", since_minutes=
     if event_type:
         et = str(event_type).upper()
         result = [e for e in result if e["type"] == et]
+    if status:
+        st = str(status).upper()
+        result = [e for e in result if e["status"] == st]
     try:
         since_minutes = int(since_minutes or 0)
     except (TypeError, ValueError):
@@ -845,12 +1127,14 @@ def _agent_get_system_config():
     }
 
 
-def _agent_send_telegram(text):
-    ok = send_telegram(str(text))
+def _agent_send_alert(text):
+    sent, channel = dispatch_message(str(text))
+    if sent:
+        return {"status": "success", "sent": True, "channel": channel, "message": f"Terkirim ke {channel}."}
     return {
-        "status": "success" if ok else "error",
-        "sent": ok,
-        "message": "Terkirim ke Telegram." if ok else "Gagal kirim — cek TELEGRAM_BOT_TOKEN/CHAT_ID di .env.",
+        "status": "error",
+        "sent": False,
+        "message": "Gagal kirim — belum ada channel notifikasi yang aktif (isi DISCORD_WEBHOOK_URL di .env).",
     }
 
 
@@ -863,7 +1147,7 @@ READ_TOOLS = {
 }
 
 ACTION_TOOLS = {
-    "send_telegram_message": lambda text: _agent_send_telegram(text),
+    "send_alert_message": lambda text: _agent_send_alert(text),
     "set_zone_rules": lambda stream_id, required=None, emergency=None: apply_zone_rules(stream_id, required, emergency),
     "set_confidence": lambda confidence: apply_confidence(confidence),
     "set_stream_paused": lambda stream_id, paused: apply_pause(stream_id, paused),
@@ -874,12 +1158,18 @@ ACTION_TOOLS = {
 AGENT_FUNCTION_DECLARATIONS = [
     {
         "name": "get_events",
-        "description": "Ambil daftar event pelanggaran APD / darurat yang tercatat sistem. Bisa difilter.",
+        "description": (
+            "Ambil daftar event pelanggaran APD / darurat yang tercatat sistem. Tiap event punya "
+            "'seq' (nomor insiden referensi, mis. #7), status siklus penuh (PENDING/CONFIRMED/"
+            "DISMISSED/DELETED), dan detail tindakan/penghapusan jika ada (action_taken, "
+            "action_note, action_at, deleted, delete_reason, deleted_at). Bisa difilter."
+        ),
         "parameters": {"type": "OBJECT", "properties": {
             "zone": {"type": "STRING", "description": "Filter nama zona atau stream_id, mis. 'Welding' atau 'stream_02'. Kosongkan untuk semua."},
             "violation_class": {"type": "STRING", "description": "Filter kelas, mis. 'NO-Mask', 'Fire'. Kosongkan untuk semua."},
             "event_type": {"type": "STRING", "description": "'VIOLATION' atau 'EMERGENCY'. Kosongkan untuk semua."},
             "since_minutes": {"type": "INTEGER", "description": "Hanya event dalam N menit terakhir. 0 = semua."},
+            "status": {"type": "STRING", "description": "'PENDING' (belum ditinjau admin), 'CONFIRMED' (sudah dikonfirmasi asli), 'DISMISSED' (dianggap salah deteksi saat review), atau 'DELETED' (dihapus admin, biasanya duplikat). Kosongkan untuk semua."},
         }},
     },
     {"name": "get_notifications", "description": "Ambil log aktivitas notifikasi yang sudah dikirim AI Agent.",
@@ -891,8 +1181,8 @@ AGENT_FUNCTION_DECLARATIONS = [
     {"name": "get_system_config", "description": "Ambil konfigurasi sistem: model deteksi aktif, confidence threshold, visibilitas kelas konteks.",
      "parameters": {"type": "OBJECT", "properties": {}}},
     {
-        "name": "send_telegram_message",
-        "description": "Kirim pesan/laporan ke grup safety via Telegram. Susun teksnya sendiri berdasarkan data.",
+        "name": "send_alert_message",
+        "description": "Kirim pesan/laporan ke channel safety (Discord/Telegram). Susun teksnya sendiri berdasarkan data.",
         "parameters": {"type": "OBJECT", "properties": {
             "text": {"type": "STRING", "description": "Isi pesan yang akan dikirim."},
         }, "required": ["text"]},
@@ -946,13 +1236,23 @@ AGENT_SYSTEM_PROMPT = (
     "Untuk permintaan yang mengubah sistem atau mengirim pesan, panggil function aksi yang sesuai satu kali; "
     "sistem akan meminta konfirmasi manusia sebelum benar-benar menjalankannya, jadi kamu tidak perlu meminta izin lagi. "
     "Konteks: stream_01 = Assembly Line A, stream_02 = Welding Bay B. "
-    "Kelas pelanggaran APD: NO-Hardhat, NO-Mask, NO-Safety Vest. Kelas darurat: Fire, Smoke."
+    "Kelas pelanggaran APD: NO-Hardhat, NO-Mask, NO-Safety Vest. Kelas darurat: Fire, Smoke. "
+    "Setiap insiden punya nomor referensi 'seq' (mis. #7) yang tetap sama sepanjang siklus "
+    "hidupnya — selalu sebutkan nomor ini saat membahas insiden tertentu, jangan pakai UUID panjang. "
+    "Siklus status penuh: PENDING (baru terdeteksi, belum ditinjau admin) -> CONFIRMED (admin "
+    "memastikan ini pelanggaran asli) atau DISMISSED (admin menandai ini salah deteksi) -> jika "
+    "CONFIRMED, admin bisa mencatat tindakan (action_taken=true, action_note berisi tindakan yang "
+    "diambil, action_at waktunya) ATAU menghapusnya sebagai duplikat (status jadi DELETED, "
+    "delete_reason berisi alasan, deleted_at waktunya) — satu insiden selalu berakhir dengan tepat "
+    "satu hasil akhir: tindakan nyata ATAU dihapus sebagai duplikat, tidak keduanya. Kalau ditanya "
+    "status suatu insiden atau tindakan apa yang diambil, gunakan get_events dan baca field "
+    "status/action_taken/action_note/action_at/deleted/delete_reason — jangan mengarang."
 )
 
 
 def describe_action(name, args):
-    if name == "send_telegram_message":
-        return f'Kirim pesan ke Telegram:\n"{args.get("text", "")}"'
+    if name == "send_alert_message":
+        return f'Kirim pesan ke channel safety:\n"{args.get("text", "")}"'
     if name == "set_zone_rules":
         parts = []
         if args.get("required") is not None:
@@ -975,13 +1275,47 @@ def describe_action(name, args):
     return name
 
 
-def run_agent_chat(history):
+def _summarize_tool_result(name, result):
+    """Short human-readable summary of a read-tool's result, shown live in the UI —
+    not the raw JSON, just enough to say what the agent found."""
+    try:
+        if name == "get_events":
+            return f"{result['count']} event ditemukan"
+        if name == "get_notifications":
+            return f"{result['count']} notifikasi ditemukan"
+        if name == "get_zone_config":
+            return f"{len(result['zones'])} zona dimuat"
+        if name == "get_stream_status":
+            return f"status {len(result.get('current', {}))} stream dimuat"
+        if name == "get_system_config":
+            return f"model aktif: {result.get('active_model')}, confidence: {result.get('confidence')}"
+    except Exception:
+        pass
+    return "selesai"
+
+
+TOOL_LABELS = {
+    "get_events": "Mengambil data event pelanggaran/darurat",
+    "get_notifications": "Mengambil log notifikasi",
+    "get_zone_config": "Mengambil konfigurasi zona",
+    "get_stream_status": "Mengecek status stream/kamera",
+    "get_system_config": "Mengecek konfigurasi sistem",
+}
+
+
+def run_agent_chat_steps(history):
+    """Generator: yields step dicts live as the agent reasons/calls tools, ending with
+    a 'final' (or 'action_proposed'/'error'/'not_configured') step. Shared by both the
+    streaming endpoint (yields each step to the UI) and the plain endpoint (drains this
+    generator and returns only the last step, for simple non-streaming callers)."""
     if not GEMINI_API_KEY:
-        return {
+        yield {
+            "step": "not_configured",
             "configured": False,
             "reply": "AI Agent belum aktif. Isi GEMINI_API_KEY di file .env untuk mengaktifkan chat.",
             "pending_action": None,
         }
+        return
 
     from google import genai
     from google.genai import types
@@ -1002,14 +1336,16 @@ def run_agent_chat(history):
             contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
 
     try:
-        for _ in range(6):  # bounded tool-calling loop
+        for round_num in range(6):  # bounded tool-calling loop
+            yield {"step": "thinking", "round": round_num + 1}
             resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
             calls = list(resp.function_calls or [])
 
             action_call = next((c for c in calls if c.name in ACTION_TOOLS), None)
             if action_call is not None:
                 args = dict(action_call.args or {})
-                return {
+                yield {
+                    "step": "action_proposed",
                     "configured": True,
                     "reply": (resp.text or "").strip(),
                     "pending_action": {
@@ -1018,28 +1354,49 @@ def run_agent_chat(history):
                         "description": describe_action(action_call.name, args),
                     },
                 }
+                return
 
-            if calls:  # all read tools -> execute, feed back, continue the loop
+            if calls:  # all read tools -> execute (with live step per tool), feed back, continue
                 contents.append(resp.candidates[0].content)
                 parts = []
                 for c in calls:
+                    args = dict(c.args or {})
+                    yield {
+                        "step": "tool_call",
+                        "name": c.name,
+                        "label": TOOL_LABELS.get(c.name, c.name),
+                        "args": args,
+                    }
                     fn = READ_TOOLS.get(c.name)
-                    result = fn(**dict(c.args or {})) if fn else {"error": "unknown tool"}
+                    result = fn(**args) if fn else {"error": "unknown tool"}
+                    yield {"step": "tool_result", "name": c.name, "summary": _summarize_tool_result(c.name, result)}
                     parts.append(types.Part.from_function_response(name=c.name, response={"result": result}))
                 contents.append(types.Content(role="user", parts=parts))
                 continue
 
-            return {"configured": True, "reply": (resp.text or "").strip(), "pending_action": None}
+            yield {"step": "final", "configured": True, "reply": (resp.text or "").strip(), "pending_action": None}
+            return
 
-        return {"configured": True, "reply": "Maaf, langkahnya terlalu panjang. Coba pertanyaan yang lebih spesifik.", "pending_action": None}
+        yield {
+            "step": "final",
+            "configured": True,
+            "reply": "Maaf, langkahnya terlalu panjang. Coba pertanyaan yang lebih spesifik.",
+            "pending_action": None,
+        }
     except Exception as e:
         print(f"[AI AGENT] chat error: {e}")
-        return {"configured": True, "reply": f"Terjadi kendala saat memproses permintaan: {e}", "pending_action": None, "error": True}
+        yield {
+            "step": "error",
+            "configured": True,
+            "reply": f"Terjadi kendala saat memproses permintaan: {e}",
+            "pending_action": None,
+            "error": True,
+        }
 
 
 @app.get("/api/agent/status")
 def agent_status():
-    return {"configured": bool(GEMINI_API_KEY), "telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}
+    return {"configured": bool(GEMINI_API_KEY), "channel": configured_channel()}
 
 
 class AgentMessage(BaseModel):
@@ -1053,8 +1410,26 @@ class AgentChatRequest(BaseModel):
 
 @app.post("/api/agent/chat")
 def agent_chat(req: AgentChatRequest):
+    """Non-streaming variant — drains the step generator, returns only the final step.
+    Kept for simple callers (curl/tests); the UI uses /api/agent/chat/stream instead."""
     history = [{"role": m.role, "text": m.text} for m in req.messages]
-    return run_agent_chat(history)
+    last = None
+    for step in run_agent_chat_steps(history):
+        last = step
+    return last or {"configured": False, "reply": "", "pending_action": None}
+
+
+@app.post("/api/agent/chat/stream")
+def agent_chat_stream(req: AgentChatRequest):
+    """Streaming variant (newline-delimited JSON) — the UI renders each step live as the
+    agent works: which tool it's calling, what it found, then the final reply/action."""
+    history = [{"role": m.role, "text": m.text} for m in req.messages]
+
+    def generate():
+        for step in run_agent_chat_steps(history):
+            yield json.dumps(step, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 class AgentExecuteRequest(BaseModel):

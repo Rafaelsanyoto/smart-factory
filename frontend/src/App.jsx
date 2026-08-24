@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, Navigate } from 'react-router-dom';
 import { Activity, BarChart, Settings, Video, LogOut, Cpu, Wifi, WifiOff, Bot } from 'lucide-react';
 import LiveMonitor from './pages/LiveMonitor';
@@ -6,6 +6,8 @@ import Analytics from './pages/Analytics';
 import Configuration from './pages/Settings';
 import AgentChat from './pages/AgentChat';
 import Login from './pages/Login';
+import { AgentChatProvider } from './context/AgentChatContext';
+import AgentWidget from './components/AgentWidget';
 
 const API_BASE = 'http://127.0.0.1:8000';
 
@@ -28,14 +30,40 @@ function NavLink({ to, icon: Icon, label }) {
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
 
-  // Lifted State: This memory persists even when navigating away from the Live Monitor
+  // Incident lists are now DERIVED from the backend's /api/events on every poll — the
+  // backend event's `status` (PENDING/CONFIRMED/DISMISSED) is the single source of
+  // truth, not client-side click history. This also means a dismissed/confirmed event
+  // can never "come back" on remount/navigation, since we're not doing incremental
+  // "seen" tracking anymore, just re-rendering the backend's current state each tick.
   const [pendingIncidents, setPendingIncidents] = useState([]);
   const [verifiedIncidents, setVerifiedIncidents] = useState([]);
 
-  // Lifted ref too: must survive LiveMonitor unmounting (page navigation), otherwise
-  // events already dismissed/confirmed re-appear in the queue on remount because the
-  // backend's /api/events history doesn't know which ones the user already handled.
-  const seenEventIdsRef = useRef(new Set());
+  const mapEvent = (e) => ({
+    id: e.id,
+    seq: e.seq,
+    time: e.timestamp,
+    type: (e.class || '').toUpperCase(),
+    zone: e.zone,
+    eventType: e.type, // VIOLATION | EMERGENCY
+    streamId: e.stream_id,
+    confidence: e.confidence,
+    status: e.status,
+    actionTaken: e.action_taken,
+    actionNote: e.action_note,
+    actionAt: e.action_at,
+  });
+
+  const refreshIncidents = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/events`);
+      const data = await res.json();
+      if (data.status !== 'success' || !Array.isArray(data.events)) return;
+      setPendingIncidents(data.events.filter((e) => e.status === 'PENDING').map(mapEvent));
+      setVerifiedIncidents(data.events.filter((e) => e.status === 'CONFIRMED').map(mapEvent));
+    } catch {
+      /* keep last known list on transient failure */
+    }
+  }, []);
 
   // Backend connectivity + active model, polled from the edge node
   const [backendOnline, setBackendOnline] = useState(false);
@@ -67,12 +95,20 @@ export default function App() {
     };
   }, [isLoggedIn]);
 
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    refreshIncidents();
+    const interval = setInterval(refreshIncidents, 1000);
+    return () => clearInterval(interval);
+  }, [isLoggedIn, refreshIncidents]);
+
   if (!isLoggedIn) {
     return <Login onLogin={() => setIsLoggedIn(true)} />;
   }
 
   return (
     <BrowserRouter>
+      <AgentChatProvider>
       <div className="min-h-screen bg-slate-950 text-slate-100 font-sans">
         
         <header className="bg-slate-900 border-b border-slate-800 px-6 py-4 flex justify-between items-center shadow-lg">
@@ -121,18 +157,15 @@ export default function App() {
 
         <main className="p-6">
           <Routes>
-            {/* THIS ROUTE MUST HAVE ALL 4 PROPS */}
-            <Route 
-              path="/" 
+            <Route
+              path="/"
               element={
                 <LiveMonitor
                   pendingIncidents={pendingIncidents}
-                  setPendingIncidents={setPendingIncidents}
                   verifiedIncidents={verifiedIncidents}
-                  setVerifiedIncidents={setVerifiedIncidents}
-                  seenEventIdsRef={seenEventIdsRef}
+                  refreshIncidents={refreshIncidents}
                 />
-              } 
+              }
             />
             <Route
               path="/analytics"
@@ -144,7 +177,9 @@ export default function App() {
           </Routes>
         </main>
 
+        <AgentWidget />
       </div>
+      </AgentChatProvider>
     </BrowserRouter>
   );
 }
