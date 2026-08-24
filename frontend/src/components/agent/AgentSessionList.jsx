@@ -1,6 +1,11 @@
 import { Plus, Trash2, MessageSquare } from 'lucide-react';
 
-function timeAgo(ts) {
+// Backend sends "YYYY-MM-DD HH:MM:SS" (SQLite, local server time) — swap the space for
+// "T" so the browser parses it as a local datetime instead of guessing the format.
+function timeAgo(sqliteTimestamp) {
+  if (!sqliteTimestamp) return '';
+  const ts = new Date(sqliteTimestamp.replace(' ', 'T')).getTime();
+  if (Number.isNaN(ts)) return '';
   const diffMin = Math.floor((Date.now() - ts) / 60000);
   if (diffMin < 1) return 'baru saja';
   if (diffMin < 60) return `${diffMin}m lalu`;
@@ -34,7 +39,7 @@ export default function AgentSessionList({ sessions, activeId, onSwitch, onNew, 
             <MessageSquare size={12} className="shrink-0 opacity-60" />
             <div className="min-w-0 flex-1">
               <p className="truncate">{s.title || 'Percakapan baru'}</p>
-              {!compact && <p className="text-[10px] text-slate-600">{timeAgo(s.createdAt)} · {s.messages.length} pesan</p>}
+              {!compact && <p className="text-[10px] text-slate-600">{timeAgo(s.updated_at)}</p>}
             </div>
             <button
               onClick={(e) => { e.stopPropagation(); onDelete(s.id); }}

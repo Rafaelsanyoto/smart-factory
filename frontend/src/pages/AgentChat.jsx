@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { Bot, Zap, AlertTriangle, WifiOff } from 'lucide-react';
 import { useAgentChat } from '../context/AgentChatContext';
-import AgentConversation, { EmptyState } from '../components/agent/AgentConversation';
+import AgentConversation, { EmptyState, LoadingState } from '../components/agent/AgentConversation';
 import AgentComposer from '../components/agent/AgentComposer';
 import AgentSessionList from '../components/agent/AgentSessionList';
 
@@ -14,7 +14,7 @@ const SUGGESTIONS = [
 
 export default function AgentChatPage() {
   const {
-    sessions, activeId, activeSession, status, loading,
+    sessions, activeId, activeSession, status, loading, messagesLoading,
     sendMessage, resolveAction, newSession, switchSession, deleteSession,
   } = useAgentChat();
   const scrollRef = useRef(null);
@@ -75,7 +75,9 @@ export default function AgentChatPage() {
           ref={scrollRef}
           className="flex-1 overflow-y-auto bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-4 shadow-xl"
         >
-          {messages.length === 0 ? (
+          {messagesLoading ? (
+            <LoadingState />
+          ) : messages.length === 0 ? (
             <EmptyState suggestions={SUGGESTIONS} onPick={sendMessage} disabled={notConfigured} />
           ) : (
             <AgentConversation messages={messages} sessionId={activeId} onResolveAction={resolveAction} />

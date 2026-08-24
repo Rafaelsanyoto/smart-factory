@@ -1,6 +1,6 @@
 import {
   Bot, User, Loader2, CheckCircle, XCircle, Zap, Sparkles,
-  Search, CheckCircle2, BrainCircuit,
+  Search, CheckCircle2, BrainCircuit, ShieldAlert,
 } from 'lucide-react';
 
 function StepRow({ step }) {
@@ -31,7 +31,37 @@ function StepRow({ step }) {
       </div>
     );
   }
+  // Actions the agent ran on its own under accept-low-risk/auto permission mode — still
+  // needs to show up in the trail, or it looks like the reply changed something "by magic".
+  if (step.step === 'action_call') {
+    return (
+      <div className="flex items-center gap-2 text-orange-400">
+        <ShieldAlert size={12} className="text-orange-400" />
+        <span>Aksi otomatis: {step.label}</span>
+        {step.args && Object.keys(step.args).length > 0 && (
+          <span className="font-mono text-[10px] text-slate-600">{JSON.stringify(step.args)}</span>
+        )}
+      </div>
+    );
+  }
+  if (step.step === 'action_result') {
+    return (
+      <div className="flex items-center gap-2 text-orange-300">
+        <CheckCircle2 size={12} className="text-orange-400" />
+        <span>{step.summary}</span>
+      </div>
+    );
+  }
   return null;
+}
+
+export function LoadingState({ compact }) {
+  return (
+    <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 gap-2 py-6">
+      <Loader2 size={compact ? 20 : 28} className="animate-spin text-slate-600" />
+      <p className="text-xs">Memuat riwayat percakapan…</p>
+    </div>
+  );
 }
 
 export function EmptyState({ suggestions = [], onPick, disabled, compact }) {

@@ -1,8 +1,33 @@
 import { useState, useEffect } from 'react';
 import {
   Sliders, Camera, Database, Save, Server, Shield, Cpu, Video, Info, WifiOff, Pause, Play,
-  Flame, Eye, EyeOff, ScanLine,
+  Flame, Eye, EyeOff, ScanLine, Bot, ShieldCheck, Zap, ShieldAlert,
 } from 'lucide-react';
+
+// Full static Tailwind class strings (not interpolated) so the JIT scanner picks them up.
+const PERMISSION_MODE_META = {
+  standard: {
+    label: 'Standard',
+    icon: ShieldCheck,
+    description: 'Semua aksi (aman maupun berisiko) selalu minta konfirmasi kamu dulu.',
+    activeClass: 'bg-emerald-600/20 border-emerald-500/40 text-emerald-300',
+    iconClass: 'text-emerald-400',
+  },
+  accept_low_risk: {
+    label: 'Accept Low-Risk',
+    icon: Zap,
+    description: 'Aksi aman (kirim pesan, toggle tampilan) langsung jalan. Aksi yang mempengaruhi deteksi (zona, confidence, pause, model) tetap minta konfirmasi.',
+    activeClass: 'bg-amber-600/20 border-amber-500/40 text-amber-300',
+    iconClass: 'text-amber-400',
+  },
+  auto: {
+    label: 'Full Auto',
+    icon: ShieldAlert,
+    description: 'Semua aksi langsung jalan tanpa konfirmasi — termasuk yang mempengaruhi deteksi. Pakai dengan hati-hati.',
+    activeClass: 'bg-red-600/20 border-red-500/40 text-red-300',
+    iconClass: 'text-red-400',
+  },
+};
 
 const API_BASE = 'http://127.0.0.1:8000';
 
@@ -19,12 +44,14 @@ export default function Configuration() {
   const [contextClasses, setContextClasses] = useState([]);
   const [contextVisible, setContextVisible] = useState({});
 
+  const [permissionMode, setPermissionMode] = useState('standard');
+  const [permissionOptions, setPermissionOptions] = useState(['standard', 'accept_low_risk', 'auto']);
+
   const [offline, setOffline] = useState(false);
   const [saveStatus, setSaveStatus] = useState('');
   const [modelStatus, setModelStatus] = useState('');
 
-  const [retention, setRetention] = useState('30');
-  const [dbUrl, setDbUrl] = useState('postgresql://admin:password@localhost:5432/hse_logs');
+  const [dbInfo, setDbInfo] = useState(null);
 
   const flash = (setter, msg, ms = 3000) => {
     setter(msg);
@@ -35,16 +62,20 @@ export default function Configuration() {
   useEffect(() => {
     (async () => {
       try {
-        const [mRes, zRes, sRes, cRes] = await Promise.all([
+        const [mRes, zRes, sRes, cRes, pRes, dRes] = await Promise.all([
           fetch(`${API_BASE}/api/models`),
           fetch(`${API_BASE}/api/zones`),
           fetch(`${API_BASE}/api/sources`),
           fetch(`${API_BASE}/api/context-classes`),
+          fetch(`${API_BASE}/api/agent/permission-mode`),
+          fetch(`${API_BASE}/api/system/db-info`),
         ]);
         const m = await mRes.json();
         const z = await zRes.json();
         const s = await sRes.json();
         const c = await cRes.json();
+        const p = await pRes.json();
+        const d = await dRes.json();
         setModels(m.models || []);
         setActiveModel(m.active || '');
         if (typeof m.confidence === 'number') setConfidence(m.confidence);
@@ -54,6 +85,9 @@ export default function Configuration() {
         setSources({ options: s.options || [], current: s.current || {}, paused: s.paused || {} });
         setContextClasses(c.classes || []);
         setContextVisible(c.visible || {});
+        setPermissionMode(p.mode || 'standard');
+        setPermissionOptions(p.options || ['standard', 'accept_low_risk', 'auto']);
+        setDbInfo(d);
         setOffline(false);
       } catch {
         setOffline(true);
@@ -162,6 +196,24 @@ export default function Configuration() {
     } catch {
       setSources((prev) => ({ ...prev, paused: { ...prev.paused, [streamId]: !next } }));
       flash(setSaveStatus, 'Pause toggle failed — backend offline.');
+    }
+  };
+
+  const handlePermissionModeChange = async (mode) => {
+    const prev = permissionMode;
+    setPermissionMode(mode);
+    try {
+      const res = await fetch(`${API_BASE}/api/agent/permission-mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      const data = await res.json();
+      if (data.status === 'success') flash(setSaveStatus, `Mode izin AI Agent: ${PERMISSION_MODE_META[mode]?.label || mode}.`);
+      else { setPermissionMode(prev); flash(setSaveStatus, 'Gagal mengubah mode izin.'); }
+    } catch {
+      setPermissionMode(prev);
+      flash(setSaveStatus, 'Gagal mengubah mode izin — backend offline.');
     }
   };
 
@@ -386,35 +438,62 @@ export default function Configuration() {
 
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl">
             <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
-              <Database size={16} className="text-purple-400" /> Data Integration
+              <Bot size={16} className="text-blue-400" /> AI Agent Permission Mode
             </h2>
-
-            <div className="space-y-4">
-              <div>
-                <label className="text-xs font-semibold text-slate-400 uppercase block mb-1">Local Log Retention</label>
-                <select
-                  value={retention}
-                  onChange={(e) => setRetention(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-700 text-slate-200 text-sm rounded-md focus:ring-blue-500 focus:border-blue-500 p-2"
-                >
-                  <option value="7">7 Days (Auto-Purge)</option>
-                  <option value="14">14 Days (Auto-Purge)</option>
-                  <option value="30">30 Days (Standard)</option>
-                  <option value="90">90 Days (Archive)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="text-xs font-semibold text-slate-400 uppercase block mb-1">Central DB Sync String (Optional)</label>
-                <input
-                  type="text"
-                  value={dbUrl}
-                  onChange={(e) => setDbUrl(e.target.value)}
-                  placeholder="postgresql://..."
-                  className="w-full bg-slate-950 border border-slate-700 text-slate-500 text-xs font-mono rounded-md focus:ring-blue-500 focus:border-blue-500 p-2"
-                />
-              </div>
+            <div className="space-y-2">
+              {permissionOptions.map((mode) => {
+                const meta = PERMISSION_MODE_META[mode] || { label: mode, icon: Bot, description: '', activeClass: '', iconClass: '' };
+                const Icon = meta.icon;
+                const active = permissionMode === mode;
+                return (
+                  <button
+                    key={mode}
+                    onClick={() => handlePermissionModeChange(mode)}
+                    disabled={offline}
+                    className={`w-full text-left flex items-start gap-2.5 px-3 py-2.5 rounded-lg border transition-colors disabled:opacity-50 ${
+                      active ? meta.activeClass : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                    }`}
+                  >
+                    <Icon size={15} className={`mt-0.5 shrink-0 ${active ? '' : meta.iconClass}`} />
+                    <div>
+                      <p className="text-xs font-semibold">{meta.label}</p>
+                      <p className="text-[10px] opacity-80 mt-0.5 leading-snug">{meta.description}</p>
+                    </div>
+                  </button>
+                );
+              })}
             </div>
+            <p className="text-[10px] text-slate-500 mt-3 flex items-center gap-1">
+              <Info size={11} /> Ini juga berlaku untuk chat lewat Discord — satu mode, semua channel.
+            </p>
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl">
+            <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
+              <Database size={16} className="text-purple-400" /> Local Persistence (SQLite)
+            </h2>
+            {dbInfo ? (
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <div className="bg-slate-950 border border-slate-800 rounded-lg p-3">
+                  <p className="text-slate-500 uppercase text-[10px] mb-1">Insiden Tercatat</p>
+                  <p className="font-mono font-bold text-slate-200 text-lg">{dbInfo.event_count}</p>
+                </div>
+                <div className="bg-slate-950 border border-slate-800 rounded-lg p-3">
+                  <p className="text-slate-500 uppercase text-[10px] mb-1">Notifikasi Tercatat</p>
+                  <p className="font-mono font-bold text-slate-200 text-lg">{dbInfo.notification_count}</p>
+                </div>
+                <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 col-span-2">
+                  <p className="text-slate-500 uppercase text-[10px] mb-1">Ukuran File</p>
+                  <p className="font-mono text-slate-300">{dbInfo.size_kb} KB</p>
+                  <p className="font-mono text-slate-600 text-[10px] mt-1 break-all">{dbInfo.path}</p>
+                </div>
+              </div>
+            ) : (
+              <p className="text-xs text-slate-500">Memuat info database…</p>
+            )}
+            <p className="text-[10px] text-slate-500 mt-3 flex items-center gap-1">
+              <Info size={11} /> Semua siklus insiden (deteksi → konfirmasi → tindakan/hapus) tersimpan permanen di sini — bertahan lewat restart server.
+            </p>
           </div>
         </div>
 

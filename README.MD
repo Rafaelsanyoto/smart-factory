@@ -6,12 +6,13 @@ Autonomous Safety Surveillance & Incident Workflow system for AI Innovation Chal
 
 ## Tech Stack
 
-**Backend** — `api.py` (single file)
+**Backend** — `backend/` package (run via `api.py`)
 - [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) — HTTP API & MJPEG video streaming
 - [Ultralytics YOLO](https://docs.ultralytics.com/) (YOLOv11m / YOLO26m) + [OpenCV](https://opencv.org/) — object detection & video capture
 - [google-genai](https://pypi.org/project/google-genai/) (Gemini) — AI Agent chat with function calling (tool use)
-- Plain `urllib` — Discord webhook / Telegram bot dispatch (no extra HTTP client dependency)
-- In-memory state only — no database. Everything (events, notifications, zone rules) lives in process memory and resets on restart.
+- [discord.py](https://pypi.org/project/discord.py/) — two-way Discord chat bot (optional)
+- Plain `urllib` — Discord webhook dispatch (no extra HTTP client dependency)
+- [SQLite](https://www.sqlite.org/) (`smart_factory.db`, stdlib `sqlite3`) — persists the full incident lifecycle, notifications, zone rules, system config, and AI Agent chat history across restarts.
 
 **Frontend** — `frontend/` (Vite + React)
 - [React](https://react.dev/) + [React Router](https://reactrouter.com/) — SPA with client-side routing
@@ -25,9 +26,27 @@ Autonomous Safety Surveillance & Incident Workflow system for AI Innovation Chal
 
 ```
 smart-factory/
-├── api.py                      # FastAPI backend — camera pipeline, rule engine, AI Agent, all endpoints
+├── api.py                      # Entry point — thin launcher: `from backend.app import app` + uvicorn
+├── backend/                    # Backend package (split by responsibility)
+│   ├── app.py                  #   Assembles FastAPI: CORS, routers, Discord startup hook
+│   ├── config.py               #   Paths, .env, model registry, PPE/zone constants
+│   ├── database.py             #   SQLite layer — all db_* helpers, schema init/seed
+│   ├── state.py                #   Runtime-mutable state (active model/confidence, zone rules, ...)
+│   ├── notifications.py        #   Notification templates, Discord dispatch, batching
+│   ├── rule_engine.py          #   Episode model + IoU matching → structured incidents
+│   ├── camera.py               #   SmoothCameraManager (capture/ai/render threads), MJPEG stream
+│   ├── actions.py              #   apply_* helpers shared by REST routes AND the AI Agent
+│   ├── agent.py                #   AI Agent: tools, Gemini function-calling loop, chat sessions
+│   ├── discord_bot.py          #   Two-way Discord chat bot (optional)
+│   └── routers/                #   FastAPI routers grouped by domain
+│       ├── streams.py          #     video, data, source/pause
+│       ├── settings.py         #     health, db-info, model/confidence, zones, context classes
+│       ├── events.py           #     incident lifecycle (verify/action/delete), notifications
+│       └── agent.py            #     all /api/agent/* endpoints
+│
+├── smart_factory.db            # SQLite database (gitignored — created on first run)
 ├── .env                        # Your local secrets (gitignored) — copy from .env.example
-├── .env.example                # Template: Gemini key, Discord/Telegram channel setup instructions
+├── .env.example                # Template: Gemini key, Discord channel + bot setup instructions
 │
 ├── model dan dataset/          # YOLO weights + training dataset (gitignored — only folder tracked)
 │   ├── yolo v11.pt
@@ -78,9 +97,14 @@ smart-factory/
 - Ask it things like *"Ada pelanggaran apa 10 menit terakhir?"*, *"Zona mana paling sering melanggar?"*, or *"Pause kamera Welding Bay"*
 
 ### Notifications
-- Deterministic, consistently-formatted messages (bold + bullet points) — no LLM involved, so wording never varies
+- Deterministic, consistently-formatted messages (bold + bullet points, every incident tagged `#seq`) — no LLM involved, so wording never varies
 - Auto-**batches** events that fire within a 2-second window into a single outbound message instead of spamming one per detection
-- Dispatched to **Discord** (webhook) or **Telegram** (bot) — optionally to **two separate channels**: one for new detections, another for "action taken" updates
+- Dispatched to **Discord** via webhook — optionally to **two separate channels**: one for new detections, another for "action taken" / deletion updates
+
+### Discord bot (two-way chat)
+- Optional: ask the AI Agent questions directly from a Discord channel, no dashboard needed
+- Requires a real **Bot Token** (not a webhook — webhooks are push-only) with Message Content Intent enabled
+- Read-only by design — it answers using the same tools as the dashboard chat, but can't execute actions from Discord (there's no confirm/cancel UI there)
 
 ---
 
@@ -106,15 +130,17 @@ Edit `.env` and fill in what you need (all optional — the app runs fine with e
 | `GEMINI_API_KEY` | Powers the AI Agent chat | https://aistudio.google.com/apikey (free tier) |
 | `GEMINI_MODEL` | Defaults to `gemini-flash-lite-latest` — has a much higher free daily quota than full "flash" models | — |
 | `DISCORD_WEBHOOK_URL` | Notification channel for new detections | Discord → Server Settings → Integrations → Webhooks → New Webhook |
-| `DISCORD_WEBHOOK_URL_ACTIONS` | Optional 2nd channel, just for "action taken" updates | Same as above, different channel |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Fallback channel if Discord isn't set | Chat `@BotFather` → `/newbot`, then `https://api.telegram.org/bot<TOKEN>/getUpdates` |
+| `DISCORD_WEBHOOK_URL_ACTIONS` | Optional 2nd channel, just for "action taken" / deletion updates | Same as above, different channel |
+| `DISCORD_BOT_TOKEN` / `DISCORD_CHAT_CHANNEL_ID` | Optional: two-way chat — ask the AI Agent from Discord directly | Discord Developer Portal → New Application → Bot tab → Reset Token (enable **Message Content Intent**), invite via OAuth2 URL Generator. Channel ID via right-click → Copy Channel ID (needs Developer Mode) |
+
+> `DISCORD_WEBHOOK_URL*` and `DISCORD_BOT_TOKEN` are different credential types — a webhook can only push messages *into* Discord, it can never read what's typed there. The bot token is what enables the two-way chat.
 
 ### 2. Backend
 
 ```bash
 python -m venv venv
 venv\Scripts\activate          # Windows
-pip install fastapi uvicorn ultralytics opencv-python numpy google-genai
+pip install fastapi uvicorn ultralytics opencv-python numpy google-genai discord.py
 python api.py
 ```
 

@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
 import { Bot, X, History, ArrowUpRight, AlertTriangle, WifiOff } from 'lucide-react';
 import { useAgentChat } from '../context/AgentChatContext';
-import AgentConversation, { EmptyState } from './agent/AgentConversation';
+import AgentConversation, { EmptyState, LoadingState } from './agent/AgentConversation';
 import AgentComposer from './agent/AgentComposer';
 import AgentSessionList from './agent/AgentSessionList';
 
@@ -17,7 +17,7 @@ export default function AgentWidget() {
   const [showHistory, setShowHistory] = useState(false);
   const scrollRef = useRef(null);
   const {
-    sessions, activeId, activeSession, status, loading,
+    sessions, activeId, activeSession, status, loading, messagesLoading,
     sendMessage, resolveAction, newSession, switchSession, deleteSession,
   } = useAgentChat();
 
@@ -85,7 +85,9 @@ export default function AgentWidget() {
               )}
 
               <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3">
-                {messages.length === 0 ? (
+                {messagesLoading ? (
+                  <LoadingState compact />
+                ) : messages.length === 0 ? (
                   <EmptyState suggestions={SUGGESTIONS} onPick={sendMessage} disabled={notConfigured} compact />
                 ) : (
                   <AgentConversation messages={messages} sessionId={activeId} onResolveAction={resolveAction} compact />
