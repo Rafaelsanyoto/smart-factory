@@ -2,3 +2,12 @@ node_modules/
 __pycache__/
 venv/
 dataset/
+dist/
+.env
+data/
+
+VIdeo Testing/*
+!VIdeo Testing/.gitkeep
+
+Gambar testing/*
+!Gambar testing/.gitkeep
