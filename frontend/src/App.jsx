@@ -1,13 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, Navigate } from 'react-router-dom';
-import { Activity, BarChart, Settings, Video, LogOut, Cpu, Wifi, WifiOff, Bot } from 'lucide-react';
+import { Activity, BarChart, Settings, Video, LogOut, Cpu, Wifi, WifiOff, Bot, ClipboardList } from 'lucide-react';
 import LiveMonitor from './pages/LiveMonitor';
 import Analytics from './pages/Analytics';
+import Incidents from './pages/Incidents';
 import Configuration from './pages/Settings';
 import AgentChat from './pages/AgentChat';
 import Login from './pages/Login';
 import { AgentChatProvider } from './context/AgentChatContext';
 import AgentWidget from './components/AgentWidget';
+import CriticalAlarmBar from './components/CriticalAlarmBar';
 
 const API_BASE = 'http://127.0.0.1:8000';
 
@@ -30,11 +32,6 @@ function NavLink({ to, icon: Icon, label }) {
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
 
-  // Incident lists are now DERIVED from the backend's /api/events on every poll — the
-  // backend event's `status` (PENDING/CONFIRMED/DISMISSED) is the single source of
-  // truth, not client-side click history. This also means a dismissed/confirmed event
-  // can never "come back" on remount/navigation, since we're not doing incremental
-  // "seen" tracking anymore, just re-rendering the backend's current state each tick.
   const [pendingIncidents, setPendingIncidents] = useState([]);
   const [verifiedIncidents, setVerifiedIncidents] = useState([]);
 
@@ -56,6 +53,7 @@ export default function App() {
     verifiedBy: e.verified_by,    // "agent" when confirmed by autonomous handling
     agentVerdict: e.agent_verdict, // real | false | uncertain (autonomous opinion)
     agentReasoning: e.agent_reasoning,
+    alarmAckAt: e.alarm_ack_at,   // set once an operator acknowledges the critical alarm
   });
 
   const refreshIncidents = useCallback(async () => {
@@ -70,7 +68,6 @@ export default function App() {
     }
   }, []);
 
-  // Backend connectivity + active model, polled from the edge node
   const [backendOnline, setBackendOnline] = useState(false);
   const [modelLabel, setModelLabel] = useState(null);
 
@@ -122,16 +119,17 @@ export default function App() {
               <Activity className="text-blue-400" size={24} />
             </div>
             <div>
-              <h1 className="text-lg font-bold tracking-wide text-white">SMART FACTORY HSE COMMAND</h1>
-              <p className="text-xs text-slate-400">Autonomous Safety Surveillance & Incident Workflow</p>
+              <h1 className="text-lg font-bold tracking-wide text-white">SafeSight AI</h1>
+              <p className="text-xs text-slate-400">Pemantauan Keselamatan & Insiden Otonom — Smart Factory HSE Command</p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 bg-slate-950 p-1 rounded-lg border border-slate-800">
             <NavLink to="/" icon={Video} label="Live Monitor" />
-            <NavLink to="/analytics" icon={BarChart} label="Analytics" />
+            <NavLink to="/incidents" icon={ClipboardList} label="Insiden" />
+            <NavLink to="/analytics" icon={BarChart} label="Analitik" />
             <NavLink to="/agent" icon={Bot} label="AI Agent" />
-            <NavLink to="/settings" icon={Settings} label="Settings" />
+            <NavLink to="/settings" icon={Settings} label="Pengaturan" />
           </div>
 
           <div className="flex items-center gap-3 text-xs">
@@ -143,7 +141,7 @@ export default function App() {
             {backendOnline ? (
               <span className="flex items-center gap-2 px-3 py-1 bg-emerald-950/50 border border-emerald-500/30 rounded-full text-emerald-400">
                 <Wifi size={13} />
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span> Backend Online
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span> Backend Aktif
               </span>
             ) : (
               <span className="flex items-center gap-2 px-3 py-1 bg-red-950/50 border border-red-500/30 rounded-full text-red-400">
@@ -155,10 +153,15 @@ export default function App() {
               onClick={() => setIsLoggedIn(false)}
               className="flex items-center gap-1 text-slate-400 hover:text-red-400 transition-colors ml-2"
             >
-              <LogOut size={14} /> Logout
+              <LogOut size={14} /> Keluar
             </button>
           </div>
         </header>
+
+        <CriticalAlarmBar
+          incidents={[...pendingIncidents, ...verifiedIncidents]}
+          onChanged={refreshIncidents}
+        />
 
         <main className="p-6">
           <Routes>
@@ -172,6 +175,7 @@ export default function App() {
                 />
               }
             />
+            <Route path="/incidents" element={<Incidents />} />
             <Route
               path="/analytics"
               element={<Analytics verifiedIncidents={verifiedIncidents} />}

@@ -1,15 +1,13 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 
 const API_BASE = 'http://127.0.0.1:8000';
-const LAST_ACTIVE_KEY = 'hse_agent_last_active_session'; // just a UI convenience — which
-// tab was open last. The actual chat content lives entirely in the backend DB now.
+const LAST_ACTIVE_KEY = 'hse_agent_last_active_session';
 
 const genId = () =>
   typeof crypto !== 'undefined' && crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-// Backend chat_messages row -> the shape the UI components expect.
 function mapServerMessage(m) {
   return {
     id: m.id,
@@ -18,8 +16,6 @@ function mapServerMessage(m) {
     steps: m.steps || [],
     streaming: false,
     pendingAction: m.pending_action || null,
-    // Resolution outcome (awaiting/done/failed/cancelled) is persisted on pending_action
-    // itself, so reloading a session shows what actually happened instead of resetting.
     actionState: m.pending_action ? (m.pending_action.state || 'awaiting') : null,
     actionResult: m.pending_action?.result || null,
   };
@@ -70,8 +66,6 @@ export function AgentChatProvider({ children }) {
     }
   }, []);
 
-  // Initial load: fetch the session list, then load whichever was last active (if it
-  // still exists) or the most recent one.
   useEffect(() => {
     (async () => {
       const list = await refreshSessions();
@@ -184,9 +178,6 @@ export function AgentChatProvider({ children }) {
               continue;
             }
             if (step.step === 'saved') {
-              // The backend persisted the agent message — remember its real DB id so a
-              // pending action can be resolved against the actual row (not the client id),
-              // and any report files generated this turn (for a download button).
               patchMessage(agentId, { serverId: step.agent_message_id, reports: step.reports || [] });
               continue;
             }
@@ -205,7 +196,7 @@ export function AgentChatProvider({ children }) {
         patchMessage(agentId, { text: 'Gagal terhubung ke backend.', error: true, streaming: false });
       } finally {
         setLoading(false);
-        refreshSessions(); // picks up the updated title/updated_at for the sidebar
+        refreshSessions();
       }
     },
     [loading, activeId, patchMessage, refreshSessions],
@@ -216,13 +207,8 @@ export function AgentChatProvider({ children }) {
       const msg = messages.find((m) => m.id === msgId);
       if (!msg?.pendingAction) return;
 
-      // Both approve and cancel go through the backend so the outcome is written to the
-      // message row — otherwise reloading the session would show "Awaiting" again even
-      // though the action was already run or dismissed.
       patchMessage(msgId, { actionState: approve ? 'running' : 'cancelled' });
       try {
-        // Prefer the server-assigned id (set from the 'saved' step); for messages loaded
-        // from history, msgId already IS the DB id, so it falls back cleanly.
         const targetId = msg.serverId || msgId;
         const res = await fetch(`${API_BASE}/api/agent/messages/${targetId}/resolve-action`, {
           method: 'POST',

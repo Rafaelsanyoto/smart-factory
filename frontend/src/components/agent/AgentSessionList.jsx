@@ -1,7 +1,5 @@
 import { Plus, Trash2, MessageSquare } from 'lucide-react';
 
-// Backend sends "YYYY-MM-DD HH:MM:SS" (SQLite, local server time) — swap the space for
-// "T" so the browser parses it as a local datetime instead of guessing the format.
 function timeAgo(sqliteTimestamp) {
   if (!sqliteTimestamp) return '';
   const ts = new Date(sqliteTimestamp.replace(' ', 'T')).getTime();

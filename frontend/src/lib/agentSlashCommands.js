@@ -1,6 +1,3 @@
-// Quick-insert prompts shown when the user types "/" in the AI Agent chat input.
-// These aren't literal backend commands — the agent only understands natural language —
-// they just pre-fill the input with a phrasing that reliably triggers the right tool.
 export const SLASH_COMMANDS = [
   { cmd: '/events', label: 'Event terbaru', insert: 'Tampilkan event pelanggaran/darurat terbaru.' },
   { cmd: '/pending', label: 'Insiden belum ditinjau', insert: 'Tampilkan insiden yang masih berstatus PENDING.' },

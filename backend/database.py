@@ -1,13 +1,3 @@
-"""SQLite persistence layer — the full incident lifecycle, notifications, zone rules,
-system config, and AI Agent chat history all survive a restart here. events/notifications
-are the source of truth (no in-memory list mirror). zone_rules/system_config are also
-persisted, but mirrored in fast in-memory globals in state.py since they're read on every
-detected frame — the DB is only touched there on writes, not on the hot path.
-
-engine_lock guards all DB access from the multiple threads that touch it (camera ai_loops,
-dispatch threads, request handlers). It's an RLock (not a plain Lock): process_rules holds
-it while calling notify_safety(), which also acquires it — a plain Lock would self-deadlock
-on that same-thread re-entry."""
 import json
 import sqlite3
 import threading
@@ -22,10 +12,8 @@ from .config import (
 db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 db_conn.row_factory = sqlite3.Row
 
-engine_lock = threading.RLock()
+engine_lock = threading.RLock()  # RLock: process_rules holds it while calling notify_safety, which re-acquires it
 
-# Chat history grows forever otherwise — cap both how many turns a single session keeps
-# and how many sessions per source (dashboard/discord) stick around, oldest pruned first.
 MAX_MESSAGES_PER_SESSION = 200
 MAX_SESSIONS_PER_SOURCE = 200
 
@@ -54,7 +42,8 @@ def init_db():
             urgency TEXT,
             verified_by TEXT,
             agent_verdict TEXT,
-            agent_reasoning TEXT
+            agent_reasoning TEXT,
+            alarm_ack_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
         CREATE INDEX IF NOT EXISTS idx_events_ts_ms ON events(ts_ms);
@@ -75,7 +64,9 @@ def init_db():
         CREATE TABLE IF NOT EXISTS zone_rules (
             stream_id TEXT PRIMARY KEY,
             label TEXT NOT NULL,
-            monitored_classes TEXT NOT NULL
+            monitored_classes TEXT NOT NULL,
+            responsible_name TEXT,
+            responsible_mention TEXT
         );
 
         CREATE TABLE IF NOT EXISTS system_config (
@@ -124,8 +115,6 @@ def init_db():
 
 
 def _seed_defaults():
-    """First-run only — populate zone_rules/system_config with the app's defaults so
-    there's something sensible to load before an admin ever changes anything."""
     if db_conn.execute("SELECT COUNT(*) c FROM zone_rules").fetchone()["c"] == 0:
         db_conn.executemany(
             "INSERT INTO zone_rules (stream_id, label, monitored_classes) VALUES (?,?,?)",
@@ -152,27 +141,16 @@ def _table_columns(table):
 
 
 def _migrate_db():
-    """Upgrade an existing DB in place to the current schema. Idempotent — safe to run on
-    every startup. Covers two changes:
-      1. events: add urgency / verified_by / agent_verdict / agent_reasoning columns.
-      2. zone_rules: convert the old {required_ppe, emergency_classes} shape into the new
-         per-class {monitored_classes} shape (display/monitor/urgency per class per zone).
-    """
-    # 1. events — additive columns are easy (nullable ALTER ADD).
+    # additive columns
     event_cols = _table_columns("events")
-    for col in ("urgency", "verified_by", "agent_verdict", "agent_reasoning"):
+    for col in ("urgency", "verified_by", "agent_verdict", "agent_reasoning", "alarm_ack_at"):
         if col not in event_cols:
             db_conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
 
-    # New system_config keys don't get picked up by _seed_defaults on an existing DB (it
-    # only seeds when the table is empty), so ensure any added keys exist here.
     if db_conn.execute("SELECT 1 FROM system_config WHERE key = 'autonomous_mode'").fetchone() is None:
         db_conn.execute("INSERT INTO system_config (key, value) VALUES ('autonomous_mode', 'off')")
 
-    # 2. zone_rules — old schema had required_ppe + emergency_classes and no
-    #    monitored_classes. Rebuild each row into the per-class config, preserving intent:
-    #    NO-* of required PPE -> monitor=warning, Fire/Smoke -> monitor=critical, and the
-    #    old global context_visibility decides each class's display flag.
+    # old required_ppe/emergency_classes -> new per-class monitored_classes
     zone_cols = _table_columns("zone_rules")
     if "monitored_classes" not in zone_cols and "required_ppe" in zone_cols:
         old_visibility = {}
@@ -197,7 +175,6 @@ def _migrate_db():
                 if c in EMERGENCY_CLASSES:
                     monitored[c] = "critical"
             classes = default_class_config(monitored)
-            # honor the old global display toggle where it was explicitly set
             for cls, cfg in classes.items():
                 if cls in old_visibility:
                     cfg["display"] = bool(old_visibility[cls])
@@ -206,17 +183,21 @@ def _migrate_db():
         db_conn.execute("ALTER TABLE zone_rules RENAME TO zone_rules_old")
         db_conn.execute(
             "CREATE TABLE zone_rules (stream_id TEXT PRIMARY KEY, label TEXT NOT NULL, "
-            "monitored_classes TEXT NOT NULL)"
+            "monitored_classes TEXT NOT NULL, responsible_name TEXT, responsible_mention TEXT)"
         )
         db_conn.executemany(
             "INSERT INTO zone_rules (stream_id, label, monitored_classes) VALUES (?,?,?)", migrated
         )
         db_conn.execute("DROP TABLE zone_rules_old")
 
+    zone_cols = _table_columns("zone_rules")
+    for col in ("responsible_name", "responsible_mention"):
+        if col not in zone_cols:
+            db_conn.execute(f"ALTER TABLE zone_rules ADD COLUMN {col} TEXT")
+
     db_conn.commit()
 
 
-# --- system_config + zone_rules -----------------------------------------------------
 def db_save_config(key, value):
     db_conn.execute(
         "INSERT INTO system_config (key, value) VALUES (?, ?) "
@@ -241,18 +222,27 @@ def db_save_zone_classes(stream_id, label, classes):
     db_conn.commit()
 
 
+def db_save_zone_responsible(stream_id, name, mention):
+    db_conn.execute(
+        "UPDATE zone_rules SET responsible_name = ?, responsible_mention = ? WHERE stream_id = ?",
+        (name, mention, stream_id),
+    )
+    db_conn.commit()
+
+
 def db_load_zone_rules():
     rows = db_conn.execute("SELECT * FROM zone_rules").fetchall()
     return {
         r["stream_id"]: {
             "label": r["label"],
             "classes": json.loads(r["monitored_classes"]),
+            "responsible_name": r["responsible_name"],
+            "responsible_mention": r["responsible_mention"],
         }
         for r in rows
     }
 
 
-# --- events + notifications ---------------------------------------------------------
 def _event_row_to_dict(row):
     d = dict(row)
     d["action_taken"] = bool(d["action_taken"])
@@ -267,7 +257,6 @@ def _notif_row_to_dict(row):
 
 
 def db_next_seq():
-    """Atomically hands out the next human-readable incident number (#1, #2, ...)."""
     current = int(db_load_config("event_seq_counter", "0"))
     nxt = current + 1
     db_save_config("event_seq_counter", nxt)
@@ -328,17 +317,12 @@ def db_get_notifications(limit=200):
 
 
 def db_get_awaiting_action():
-    """CONFIRMED incidents that haven't had a remediation recorded yet — the set the
-    reminder loop nags about until someone acts (or dismisses)."""
     rows = db_conn.execute(
         "SELECT * FROM events WHERE status='CONFIRMED' AND action_taken=0 AND deleted=0 ORDER BY ts_ms ASC"
     ).fetchall()
     return [_event_row_to_dict(r) for r in rows]
 
 
-# --- AI feedback: when a human overrides an agent's CONFIRM (dismisses it), that's a
-# labeled "the AI got this wrong" example — captured here (with the evidence image) as an
-# accuracy signal and a hard-case dataset for later prompt/threshold tuning. ---------
 def db_insert_feedback(event, human_decision, source, image_path=None):
     fid = str(uuid.uuid4())
     db_conn.execute(
@@ -381,9 +365,6 @@ def db_update_notification(note_id, **fields):
     db_conn.commit()
 
 
-# --- AI Agent chat sessions/messages — full conversation history, persisted so it
-# survives a restart and is loadable later, and so the Discord bot (which has no
-# client-side state of its own) can have real multi-turn memory per channel. ---------
 def db_create_session(source="dashboard", discord_channel_id=None, title="Percakapan baru"):
     session_id = str(uuid.uuid4())
     now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -458,8 +439,7 @@ def db_get_messages(session_id, limit=None):
     query = "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC"
     params = [session_id]
     if limit:
-        # rowid isn't a real column exposed by "SELECT *" on a subquery, so alias it
-        # explicitly to sort the outer (oldest-first) pass after the inner LIMIT.
+        # rowid isn't exposed by SELECT * on a subquery, alias it explicitly
         query = (
             "SELECT * FROM (SELECT *, rowid AS _rid FROM chat_messages WHERE session_id = ? "
             "ORDER BY created_at DESC, rowid DESC LIMIT ?) ORDER BY created_at ASC, _rid ASC"
@@ -518,8 +498,6 @@ def db_prune_sessions(source):
     db_conn.commit()
 
 
-# Build/migrate/seed the schema at import so state.py (which loads config out of it) and
-# every db_* caller can assume the current schema exists.
 init_db()
 _migrate_db()
 _seed_defaults()

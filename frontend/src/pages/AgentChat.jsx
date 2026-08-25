@@ -55,7 +55,7 @@ export default function AgentChatPage() {
                 : 'text-slate-500 border-slate-800 bg-slate-900'
             }`}
           >
-            <Zap size={12} /> {status.channel ? `${status.channel} aktif` : 'notif off'}
+            <Zap size={12} /> {status.channel ? `${status.channel} aktif` : 'notifikasi nonaktif'}
           </span>
         </div>
 

@@ -1,6 +1,3 @@
-"""Camera manager — one shared OpenCV capture per stream feeding three threads: capture
-(reads raw frames), ai (runs YOLO + the rule engine), and render (draws overlays into a
-JPEG for the MJPEG stream). A single capture avoids double-opening the same webcam/file."""
 import asyncio
 import threading
 import time
@@ -17,10 +14,7 @@ from . import autonomous
 
 
 def _evidence_jpeg(frame, box):
-    """Full-frame JPEG with the triggering detection boxed + labeled. A full scene with a
-    highlight box is clearer evidence than a tight crop (you see where/what in context), and
-    gives the autonomous vision model more context while still pointing it at the region.
-    Returns bytes, or None on failure."""
+    # full frame with the detection boxed + labeled (better evidence than a tight crop)
     img = frame.copy()
     x1, y1, x2, y2 = (int(v) for v in (box.get("xyxy") or [0, 0, 0, 0]))
     cls = box.get("class_name", "")
@@ -45,12 +39,12 @@ class SmoothCameraManager:
         self.model = YOLO(MODEL_REGISTRY[DEFAULT_MODEL]["path"])
         self.model_lock = threading.Lock()
 
-        self.latest_frame = None          # raw frame from the single capture
+        self.latest_frame = None
         self.frame_lock = threading.Lock()
-        self.current_frame_bytes = None   # rendered JPEG for streaming
+        self.current_frame_bytes = None
         self.latest_boxes = []
         self.running = True
-        self.paused = True  # start paused — nothing captured/detected until an admin resumes it
+        self.paused = True
 
         self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         self.capture_thread.start()
@@ -61,14 +55,13 @@ class SmoothCameraManager:
         self.render_thread = threading.Thread(target=self.render_loop, daemon=True)
         self.render_thread.start()
 
-    # -- source control ------------------------------------------------------
     def switch_source(self, resolved):
         with self.source_lock:
             self.source = resolved
             self.source_version += 1
 
     def switch_model(self, path):
-        new_model = YOLO(path)  # heavy load done outside the lock
+        new_model = YOLO(path)
         with self.model_lock:
             self.model = new_model
             self.latest_boxes = []
@@ -76,14 +69,12 @@ class SmoothCameraManager:
     def set_paused(self, value):
         self.paused = bool(value)
 
-    # -- threads -------------------------------------------------------------
     def capture_loop(self):
         cap = cv2.VideoCapture(self.source)
         local_version = self.source_version
         is_file = isinstance(self.source, str)
 
         while self.running:
-            # Reopen if the source changed
             if self.source_version != local_version:
                 cap.release()
                 with self.source_lock:
@@ -93,15 +84,15 @@ class SmoothCameraManager:
                 is_file = isinstance(new_source, str)
 
             if self.paused:
-                time.sleep(0.15)  # freeze feed, stop reading — lighter during testing
+                time.sleep(0.15)
                 continue
 
             success, frame = cap.read()
             if not success:
                 if is_file:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # loop the dummy video
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 else:
-                    time.sleep(0.1)  # webcam hiccup, retry
+                    time.sleep(0.1)
                 continue
 
             frame = cv2.resize(frame, (640, 480))
@@ -115,7 +106,7 @@ class SmoothCameraManager:
     def ai_loop(self):
         while self.running:
             if self.paused:
-                time.sleep(0.15)  # skip inference — the expensive part — while paused
+                time.sleep(0.15)
                 continue
 
             with self.frame_lock:
@@ -141,9 +132,6 @@ class SmoothCameraManager:
                 })
 
             self.latest_boxes = boxes_data
-            # process_rules tags boxes with episode_status and returns events created this
-            # frame. We hold the frame here, so we crop each new detection for evidence,
-            # then notify (with the crop) and hand off to the autonomous worker if enabled.
             new_events = process_rules(self.stream_id, boxes_data)
             for event, box in new_events:
                 crop = _evidence_jpeg(frame, box)
@@ -183,11 +171,11 @@ class SmoothCameraManager:
 
                 cls_upper = box["class_name"].upper()
                 if "NO-" in cls_upper:
-                    color = (0, 0, 255)        # red — violation
+                    color = (0, 0, 255)
                 elif box["class_name"] in EMERGENCY_CLASSES:
-                    color = (0, 128, 255)      # orange — emergency
+                    color = (0, 128, 255)
                 else:
-                    color = (0, 255, 0)        # green — compliant/neutral
+                    color = (0, 255, 0)
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
@@ -215,8 +203,6 @@ class SmoothCameraManager:
         return self.current_frame_bytes
 
 
-# One manager per configured stream. Creating these starts the capture/ai/render threads
-# immediately (they idle while paused, which is the default on startup).
 cameras = {stream_id: SmoothCameraManager(src, stream_id) for stream_id, src in STREAM_SOURCES.items()}
 
 

@@ -25,7 +25,6 @@ export default function AgentWidget() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [activeSession?.messages, loading, open]);
 
-  // Skip rendering the widget on the dedicated /agent page — it's already the full view.
   if (location.pathname === '/agent') return null;
 
   const messages = activeSession?.messages || [];

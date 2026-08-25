@@ -1,7 +1,3 @@
-"""Discord bot — two-way AI Agent chat directly from a Discord channel (read-only: it can
-answer questions using the same tools, but can't execute actions — no confirm UI there).
-Runs as a background asyncio task inside the SAME event loop FastAPI/uvicorn uses; launch()
-is called from the app's startup event."""
 import asyncio
 import os
 
@@ -18,9 +14,7 @@ except ImportError:
 discord_bot_client = None
 
 if _discord is not None and DISCORD_BOT_TOKEN:
-    _discord.utils.setup_logging()  # discord.py logs via the `logging` module, not
-                                     # print() — without a handler configured its own
-                                     # connect/auth diagnostics are silently swallowed.
+    _discord.utils.setup_logging()
     _intents = _discord.Intents.default()
     _intents.message_content = True
     discord_bot_client = _discord.Client(intents=_intents)
@@ -29,8 +23,6 @@ if _discord is not None and DISCORD_BOT_TOKEN:
     async def on_ready():
         print(f"[Discord Bot] Logged in as {discord_bot_client.user}")
 
-    # --- Incident follow-up: the reminder loop (followup.py) sends "belum ditindak"
-    # messages through this sender so users can acknowledge with a ✅ / ❌ reaction. ------
     async def _async_send_incident(event, text):
         try:
             ch = discord_bot_client.get_channel(int(DISCORD_CHAT_CHANNEL_ID))
@@ -44,7 +36,6 @@ if _discord is not None and DISCORD_BOT_TOKEN:
             print(f"[Discord Bot] send incident error: {e}")
 
     def _incident_sender(event, text):
-        """Called from followup's worker thread — schedule the async send on the bot loop."""
         if not DISCORD_CHAT_CHANNEL_ID:
             return False
         loop = discord_bot_client.loop
@@ -57,7 +48,6 @@ if _discord is not None and DISCORD_BOT_TOKEN:
 
     @discord_bot_client.event
     async def on_raw_reaction_add(payload):
-        # Acknowledge an incident by reacting on the bot's reminder message.
         if discord_bot_client.user and payload.user_id == discord_bot_client.user.id:
             return
         event_id = followup.event_for_message(payload.message_id)
@@ -81,9 +71,6 @@ if _discord is not None and DISCORD_BOT_TOKEN:
             pass
 
     class ConfirmActionView(_discord.ui.View):
-        """Approve/Cancel buttons attached to a bot reply that proposed an action. Executes
-        via the same resolve_pending_action() the web UI uses, so the outcome is persisted
-        identically. Times out after 5 minutes."""
         def __init__(self, message_id, description):
             super().__init__(timeout=300)
             self.message_id = message_id
@@ -121,15 +108,12 @@ if _discord is not None and DISCORD_BOT_TOKEN:
             session_id = db_get_or_create_discord_session(message.channel.id)
 
         async with message.channel.typing():
-            # run_agent_chat_session_final does blocking network calls (Gemini) — offload
-            # to a thread so it doesn't stall the bot's event loop for other events. Using
-            # a per-channel session gives the bot real multi-turn memory, unlike before.
+            # while wait for agent respond
             result = await asyncio.to_thread(run_agent_chat_session_final, session_id, question)
 
         reply = (result.get("reply") or "").strip() or "Maaf, tidak ada jawaban."
         pending = result.get("pending_action")
 
-        # Attach any report files generated this turn as real downloadable attachments.
         files = []
         for r in (result.get("reports") or []):
             try:
@@ -138,9 +122,6 @@ if _discord is not None and DISCORD_BOT_TOKEN:
             except Exception as e:
                 print(f"[Discord Bot] attach report failed: {e}")
 
-        # An action reaches here (still pending) only when the permission mode requires a
-        # human to confirm it — auto / accept-low-risk actions already ran inline. Offer the
-        # confirm buttons right in Discord instead of forcing a trip to the dashboard.
         if pending and result.get("agent_message_id"):
             desc = pending.get("description", "Aksi")
             view = ConfirmActionView(result["agent_message_id"], desc)
@@ -153,13 +134,10 @@ elif DISCORD_BOT_TOKEN and _discord is None:
           "(pip install discord.py) — Discord chat is disabled.")
 
 
-_discord_bot_task = None  # must keep a strong reference — asyncio only holds a weak one,
-                          # an unreferenced task can be garbage-collected mid-flight
+_discord_bot_task = None  # keep a strong ref, asyncio only holds a weak one
 
 
 def launch():
-    """Start the bot's gateway connection as a background task. Called from the FastAPI
-    startup event so it runs inside the already-running event loop."""
     global _discord_bot_task
     if discord_bot_client is not None:
         _discord_bot_task = asyncio.create_task(discord_bot_client.start(DISCORD_BOT_TOKEN))

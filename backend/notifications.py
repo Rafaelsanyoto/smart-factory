@@ -1,8 +1,3 @@
-"""Notification formatting + dispatch. Notifications are deterministic (fixed bold+bullet
-templates, no LLM) so wording never varies from one violation to the next, and every one
-carries the incident's #seq for cross-referencing. Detection notifications are debounced
-into batches (a burst of near-simultaneous violations becomes one Discord message);
-action/delete outcomes are dispatched immediately in a background thread."""
 import json
 import threading
 import urllib.request
@@ -12,7 +7,6 @@ from .config import DISCORD_WEBHOOK_URL, DISCORD_WEBHOOK_URL_ACTIONS
 from .database import engine_lock, db_insert_notification, db_update_notification
 from . import state
 
-# Icon per urgency tier — drives the notification's visual weight.
 URGENCY_ICON = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}
 
 
@@ -21,10 +15,6 @@ def _pct(confidence):
 
 
 def format_notification(event):
-    """Deterministic, consistently-formatted notification for a single event — same
-    structure every time (bold labels + bullet points), no LLM involved so wording never
-    varies from one violation to the next. Icon + severity follow the event's urgency tier.
-    """
     urgency = event.get("urgency", "warning")
     is_emergency = event["type"] == "EMERGENCY"
     icon = URGENCY_ICON.get(urgency, "⚠️")
@@ -45,11 +35,6 @@ def format_notification(event):
 
 
 def format_batch_notification(batch_events):
-    """Deterministic notification covering multiple events that fired close together in
-    time — grouped by zone, same bold+bullet structure as the single-event format. This
-    is what keeps a burst of near-simultaneous violations to a single external message
-    instead of one each.
-    """
     has_emergency = any(e["type"] == "EMERGENCY" for e in batch_events)
     urgencies = [e.get("urgency", "warning") for e in batch_events]
     top_urgency = "critical" if "critical" in urgencies else ("warning" if "warning" in urgencies else "info")
@@ -72,8 +57,6 @@ def format_batch_notification(batch_events):
 
 
 def format_action_notification(event):
-    """Deterministic notification sent when an admin records the remediation taken on a
-    CONFIRMED incident — same bold+bullet structure, routed to the 'action' channel."""
     lines = [
         "✅ **TINDAKAN DICATAT**",
         f"• **Insiden:** #{event.get('seq', '?')}",
@@ -86,11 +69,23 @@ def format_action_notification(event):
     return "\n".join(lines)
 
 
+def format_ai_confirmed_notification(event, mention=None):
+    lines = []
+    if mention:
+        lines.append(mention)
+    lines += [
+        "🤖 **DIKONFIRMASI AI — PERLU TINDAKAN**",
+        f"• **Insiden:** #{event.get('seq', '?')}",
+        f"• **Zona:** {event['zone']}",
+        f"• **Jenis:** {event['class']}",
+        f"• **Waktu:** {event['timestamp']}",
+        f"• **Alasan AI:** {event.get('agent_reasoning') or '-'}",
+        "• **Status:** Menunggu tindakan — catat penyelesaiannya di dashboard.",
+    ]
+    return "\n".join(lines)
+
+
 def format_delete_notification(event):
-    """Deterministic notification sent when an admin deletes an incident (typically a
-    duplicate) — this is still logged as the incident's final outcome, not a silent
-    removal, so the audit trail stays one-violation-one-outcome. Routed to the 'action'
-    channel alongside remediation updates."""
     lines = [
         "🗑️ **INSIDEN DIHAPUS**",
         f"• **Insiden:** #{event.get('seq', '?')}",
@@ -104,8 +99,6 @@ def format_delete_notification(event):
 
 
 def _multipart_body(text, images):
-    """Build a multipart/form-data body carrying the message + up to 10 JPEG attachments,
-    as Discord's webhook API expects (payload_json field + files[i] parts)."""
     boundary = "----SmartFactoryHSE" + uuid.uuid4().hex
     payload = json.dumps({"content": str(text)[:1900]})
     out = []
@@ -123,18 +116,15 @@ def _multipart_body(text, images):
 
 
 def send_discord(text, webhook_url, images=None):
-    """Dispatch a message to a specific Discord webhook, optionally with JPEG evidence
-    attachments. Returns True on confirmed delivery."""
     if not webhook_url:
         return False
-    # A User-Agent header is required — Discord's Cloudflare front rejects the default
-    # urllib agent ("Python-urllib/x.y") with 403 Forbidden.
+    # custom User-Agent required, Discord rejects the default urllib one
     headers = {"User-Agent": "SmartFactoryHSE/1.0"}
     if images:
         body, boundary = _multipart_body(text, images)
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
     else:
-        body = json.dumps({"content": str(text)[:1900]}).encode()  # Discord caps at 2000 chars
+        body = json.dumps({"content": str(text)[:1900]}).encode()
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(webhook_url, data=body, headers=headers)
     try:
@@ -146,11 +136,6 @@ def send_discord(text, webhook_url, images=None):
 
 
 def configured_channel(purpose="detection"):
-    """Which external notify channel is active for a given purpose, or None.
-
-    purpose: "detection" (new events) or "action" (remediation updates — routed to the
-    second Discord channel if configured, otherwise falls back to the main one).
-    """
     if purpose == "action" and DISCORD_WEBHOOK_URL_ACTIONS:
         return "discord"
     if DISCORD_WEBHOOK_URL:
@@ -159,8 +144,6 @@ def configured_channel(purpose="detection"):
 
 
 def dispatch_message(text, purpose="detection", images=None):
-    """Send to whichever external channel is configured for this purpose. Returns
-    (sent, channel)."""
     if purpose == "action" and DISCORD_WEBHOOK_URL_ACTIONS:
         return send_discord(text, DISCORD_WEBHOOK_URL_ACTIONS, images), "discord"
     if DISCORD_WEBHOOK_URL:
@@ -168,17 +151,13 @@ def dispatch_message(text, purpose="detection", images=None):
     return False, None
 
 
-# Batching: events that fire within this window of the FIRST one in a batch are combined
-# into a single external message instead of one each — a burst of 3 near-simultaneous
-# violations sends 1 Discord message, not 3.
 BATCH_WINDOW_SECONDS = 2.0
 _batch_lock = threading.Lock()
-_batch_pending = []   # list of (event, note) accumulated in the current window
+_batch_pending = []
 _batch_timer = None
 
 
 def _flush_batch():
-    """Runs once, ~BATCH_WINDOW_SECONDS after the first event of a batch arrived."""
     global _batch_timer
     with _batch_lock:
         batch = _batch_pending[:]
@@ -196,9 +175,7 @@ def _flush_batch():
     else:
         text, _ = format_batch_notification(batch_events)
 
-    # Attach the cropped detection(s) as photo evidence (Discord allows up to 10).
     images = [state.event_crops[e["id"]] for e in batch_events if e["id"] in state.event_crops]
-
     sent, channel = dispatch_message(text, images=images or None)
 
     with engine_lock:
@@ -210,14 +187,6 @@ def _flush_batch():
 
 
 def notify_safety(event):
-    """AI Agent entry point: notifies the safety division when an event is raised.
-
-    Builds a consistently-formatted notification immediately (deterministic — same bold
-    + bullet-point structure every time, no LLM involved so wording never varies), then
-    queues it for a debounced batch: the first event in a new window starts a
-    BATCH_WINDOW_SECONDS timer, and everything else that arrives before it fires is
-    combined into ONE external message instead of one each.
-    """
     msg, severity = format_notification(event)
 
     note = {
@@ -234,11 +203,8 @@ def notify_safety(event):
     with engine_lock:
         db_insert_notification(note)
 
-    # Escalation tiers: 'info' is logged only (recorded above, visible in the dashboard log)
-    # and NOT pushed to Discord. 'warning'/'critical' go out to the external channel via the
-    # debounced batch below.
     if event.get("urgency", "warning") == "info":
-        return
+        return  # info: logged only, not pushed externally
 
     global _batch_timer
     with _batch_lock:
@@ -250,9 +216,6 @@ def notify_safety(event):
 
 
 def _log_and_dispatch_outcome(note_id, event_id, timestamp, text, severity, stream_id, log_label):
-    """Shared by notify_action_taken / notify_deleted: log immediately, dispatch to the
-    'action' channel in the background. Not part of the detection batching window — these
-    are deliberate one-off admin actions, not a burst of automatic detections."""
     note = {
         "id": note_id,
         "event_id": event_id,
@@ -278,7 +241,6 @@ def _log_and_dispatch_outcome(note_id, event_id, timestamp, text, severity, stre
 
 
 def notify_action_taken(event):
-    """Notification when an admin records remediation on a CONFIRMED incident."""
     _log_and_dispatch_outcome(
         f"{event['id']}-action", event["id"], event["action_at"], format_action_notification(event),
         "resolved", event["stream_id"], "action taken",
@@ -286,9 +248,15 @@ def notify_action_taken(event):
 
 
 def notify_deleted(event):
-    """Notification when an admin deletes an incident (e.g. a duplicate) — still logged
-    as the incident's final outcome, not a silent removal."""
     _log_and_dispatch_outcome(
         f"{event['id']}-deleted", event["id"], event["deleted_at"], format_delete_notification(event),
         "deleted", event["stream_id"], "incident deleted",
+    )
+
+
+def notify_ai_confirmed(event, mention=None):
+    _log_and_dispatch_outcome(
+        f"{event['id']}-ai-confirmed", event["id"], event["verified_at"],
+        format_ai_confirmed_notification(event, mention),
+        event.get("urgency", "warning"), event["stream_id"], "AI confirmed",
     )

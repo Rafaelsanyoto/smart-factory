@@ -1,4 +1,3 @@
-"""Report file download + on-demand generation endpoints."""
 import os
 
 from fastapi import APIRouter
@@ -27,7 +26,6 @@ def download_report(filename: str):
 
 @router.get("/api/reports/generate")
 def generate(format: str = "pdf", since_hours: float = 24, zone: str = ""):
-    """Direct download without the agent — generate + stream the file back."""
     res = generate_report_file(format, since_hours, zone)
     if res.get("status") != "success":
         return res

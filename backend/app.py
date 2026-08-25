@@ -1,6 +1,3 @@
-"""Assembles the FastAPI application: CORS, routers, and the Discord bot startup hook.
-Importing this module also triggers the import chain that starts the camera threads (they
-idle while paused, which is the default on startup)."""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 

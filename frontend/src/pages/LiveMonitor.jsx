@@ -1,28 +1,33 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import {
   Camera, ShieldAlert, CheckCircle, XCircle, MapPin, AlertTriangle,
   Video, Flame, Bot, ScanLine, Pause, Play, Clock, CheckCheck, Info, Send, Loader2, Trash2, Hash, Radar,
+  ArrowRight,
 } from 'lucide-react';
+
+const URGENCY_RANK = { critical: 0, warning: 1, info: 2 };
+function byUrgencyThenOldest(a, b) {
+  const ra = URGENCY_RANK[a.urgency] ?? 3;
+  const rb = URGENCY_RANK[b.urgency] ?? 3;
+  if (ra !== rb) return ra - rb;
+  return (a.tsMs || 0) - (b.tsMs || 0);
+}
 
 const API_BASE = 'http://127.0.0.1:8000';
 
-// Urgency tier -> static badge classes (per-zone per-class severity).
 const URGENCY_META = {
   info: { label: 'INFO', cls: 'text-slate-400 bg-slate-800/60 border-slate-700' },
   warning: { label: 'WARNING', cls: 'text-amber-300 bg-amber-950/50 border-amber-800/40' },
   critical: { label: 'CRITICAL', cls: 'text-red-300 bg-red-950/50 border-red-800/40' },
 };
 
-// The autonomous agent's opinion on a still-PENDING incident (it never auto-dismisses —
-// false/uncertain are left for a human, with this note attached).
 const AGENT_VERDICT_META = {
   real: { label: 'AI: pelanggaran nyata', cls: 'text-emerald-300 bg-emerald-950/40 border-emerald-800/40' },
   false: { label: 'AI: kemungkinan salah deteksi', cls: 'text-slate-300 bg-slate-800/60 border-slate-700' },
   uncertain: { label: 'AI: ragu — perlu review', cls: 'text-amber-300 bg-amber-950/40 border-amber-800/40' },
 };
 
-// A CONFIRMED incident is "overdue" if it's been awaiting a human's remediation longer than
-// its urgency allows — mirrors the backend reminder cadence (critical 2m / warning 10m).
 const OVERDUE_MS = { critical: 120_000, warning: 600_000 };
 function isOverdue(log) {
   if (log.actionTaken || !log.tsMs) return false;
@@ -37,7 +42,6 @@ const CAMERA_REGISTRY = [
 
 const EMERGENCY_LABELS = ['FIRE', 'SMOKE'];
 
-// Color intent for a detection label — keeps the command-center semantics consistent.
 function labelTone(label) {
   if (label.includes('NO-')) return 'text-red-400 border-red-800/40 bg-red-950/40';
   if (EMERGENCY_LABELS.includes(label)) return 'text-orange-400 border-orange-800/40 bg-orange-950/40';
@@ -45,8 +49,6 @@ function labelTone(label) {
   return 'text-emerald-400 border-emerald-800/40 bg-emerald-950/30';
 }
 
-// Inline form for recording remediation on a CONFIRMED incident — completes the
-// PENDING -> CONFIRMED -> action-taken tracking cycle.
 function ActionForm({ incidentId, onSubmit }) {
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
@@ -95,35 +97,6 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
   const [emergencyActive, setEmergencyActive] = useState(false);
   const [paused, setPaused] = useState(false);
 
-  const audioCtxRef = useRef(null);
-  const lastBeepRef = useRef(0);
-
-  const playAlarm = () => {
-    const now = Date.now();
-    if (now - lastBeepRef.current < 1500) return; // throttle
-    lastBeepRef.current = now;
-    try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      const ctx = audioCtxRef.current || (audioCtxRef.current = new Ctx());
-      if (ctx.state === 'suspended') ctx.resume();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'square';
-      osc.frequency.setValueAtTime(880, ctx.currentTime);
-      osc.frequency.setValueAtTime(660, ctx.currentTime + 0.18);
-      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.14, ctx.currentTime + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.36);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.37);
-    } catch {
-      /* audio not available */
-    }
-  };
-
-  // Live detection feed for the currently viewed stream (breakdown + stat + emergency banner)
   useEffect(() => {
     setAllDetections([]);
     setEmergencyActive(false);
@@ -141,9 +114,7 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
         }));
         setAllDetections(parsed);
 
-        const hasEmergency = parsed.some((d) => EMERGENCY_LABELS.includes(d.label));
-        setEmergencyActive(hasEmergency);
-        if (hasEmergency && !data.paused) playAlarm();
+        setEmergencyActive(parsed.some((d) => EMERGENCY_LABELS.includes(d.label)));
       } catch (err) {
         console.error('Data polling error:', err);
       }
@@ -151,9 +122,6 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
     return () => clearInterval(interval);
   }, [activeStream]);
 
-  // AI Agent activity log. The incident queue itself (pendingIncidents/verifiedIncidents)
-  // is now polled once at the App.jsx level from /api/events, since the backend's event
-  // `status` field is the single source of truth — see App.jsx's refreshIncidents.
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
@@ -218,7 +186,17 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
     if (typeof refreshIncidents === 'function') refreshIncidents();
   };
 
-  // Derived views
+  // sorted so critical/oldest never gets buried under a growing queue
+  const sortedPending = [...pendingIncidents].sort(byUrgencyThenOldest);
+  const sortedAwaitingAction = [...verifiedIncidents].filter((i) => !i.actionTaken).sort(byUrgencyThenOldest);
+  const sortedActioned = [...verifiedIncidents].filter((i) => i.actionTaken).sort((a, b) => (b.tsMs || 0) - (a.tsMs || 0));
+  const sortedVerified = [...sortedAwaitingAction, ...sortedActioned];
+  const pendingUrgencyCounts = pendingIncidents.reduce((acc, i) => {
+    const key = i.urgency || 'info';
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+
   const violationCount = allDetections.filter((d) => d.label.includes('NO-')).length;
   const breakdown = Object.values(
     allDetections.reduce((acc, d) => {
@@ -232,22 +210,20 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
   ).sort((a, b) => b.count - a.count);
 
   return (
-    <div className="grid grid-cols-3 gap-6">
-      <div className="col-span-2 space-y-6">
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-xl font-bold text-white flex items-center gap-2">
+          <Video size={20} className="text-blue-400" /> Live Monitor
+        </h1>
+        <p className="text-xs text-slate-400 mt-1">Pantau feed kamera dan tinjau insiden secara langsung.</p>
+      </div>
 
-        {emergencyActive && (
-          <div className="flex items-center gap-3 bg-orange-950/60 border border-orange-500/50 rounded-lg px-4 py-3 shadow-lg animate-pulse">
-            <Flame size={20} className="text-orange-400" />
-            <div>
-              <p className="text-sm font-bold text-orange-300 tracking-wide">EMERGENCY — FIRE/SMOKE DETECTED</p>
-              <p className="text-[11px] text-orange-400/80 font-mono">Feed {activeStream.toUpperCase()} · safety division auto-notified</p>
-            </div>
-          </div>
-        )}
+      <div className="grid grid-cols-3 gap-6">
+      <div className="col-span-2 space-y-6">
 
         <div className="flex items-center gap-4 bg-slate-900/50 p-2 rounded-lg border border-slate-800/50 w-fit">
           <label htmlFor="camera-select" className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
-            Select Feed:
+            Pilih Kamera:
           </label>
           <div className="relative">
             <select
@@ -267,7 +243,7 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
         <div className="bg-slate-900 rounded-xl p-4 border border-slate-800 shadow-2xl relative">
           <div className="flex justify-between items-center mb-4">
             <h2 className="text-sm font-semibold flex items-center gap-2 text-slate-200">
-              <Camera size={18} className="text-blue-400" /> Active Feed // {activeStream.toUpperCase()}
+              <Camera size={18} className="text-blue-400" /> Feed Aktif // {activeStream.toUpperCase()}
             </h2>
             <button
               onClick={togglePause}
@@ -277,7 +253,7 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
                   : 'bg-slate-950 border-slate-700 text-slate-300 hover:border-slate-500'
               }`}
             >
-              {paused ? <><Play size={13} /> Resume Feed</> : <><Pause size={13} /> Pause Feed</>}
+              {paused ? <><Play size={13} /> Lanjutkan</> : <><Pause size={13} /> Jeda</>}
             </button>
           </div>
 
@@ -290,7 +266,7 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
             />
             {paused && (
               <div className="absolute top-3 left-3 flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-950/80 border border-slate-700 text-slate-300 text-xs font-mono">
-                <Pause size={12} /> PAUSED
+                <Pause size={12} /> DIJEDA
               </div>
             )}
           </div>
@@ -298,21 +274,21 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
 
         <div className="grid grid-cols-3 gap-4">
           <div className="bg-slate-900 p-4 rounded-xl border border-slate-800">
-            <p className="text-xs text-slate-400 uppercase">Pending Review</p>
+            <p className="text-xs text-slate-400 uppercase">Menunggu Review</p>
             <p className="text-3xl font-mono font-bold mt-1 text-amber-400">{pendingIncidents.length}</p>
           </div>
           <div className="bg-slate-900 p-4 rounded-xl border border-slate-800">
-            <p className="text-xs text-slate-400 uppercase">Active Violations</p>
+            <p className="text-xs text-slate-400 uppercase">Pelanggaran Aktif</p>
             <p className="text-3xl font-mono font-bold mt-1 text-red-400">{violationCount}</p>
           </div>
           <div className="bg-slate-900 p-4 rounded-xl border border-slate-800">
-            <p className="text-xs text-slate-400 uppercase">Safety Status</p>
+            <p className="text-xs text-slate-400 uppercase">Status Keselamatan</p>
             <p className={`text-xl font-mono font-bold mt-2 ${
               emergencyActive ? 'text-orange-400 animate-pulse'
               : violationCount > 0 ? 'text-red-500 animate-pulse'
               : 'text-emerald-400'
             }`}>
-              {emergencyActive ? 'EMERGENCY' : violationCount > 0 ? 'VIOLATION' : 'SECURE'}
+              {emergencyActive ? 'DARURAT' : violationCount > 0 ? 'PELANGGARAN' : 'AMAN'}
             </p>
           </div>
         </div>
@@ -320,7 +296,7 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 shadow-xl">
           <div className="flex items-center justify-between mb-1">
             <h2 className="text-sm font-semibold flex items-center gap-2 text-slate-200">
-              <ScanLine size={16} className="text-blue-400" /> Live Detection Breakdown // {activeStream.toUpperCase()}
+              <ScanLine size={16} className="text-blue-400" /> Rincian Deteksi Langsung // {activeStream.toUpperCase()}
             </h2>
           </div>
           <p className="text-[10px] text-slate-500 mb-3 flex items-center gap-1">
@@ -328,7 +304,7 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
           </p>
           {breakdown.length === 0 ? (
             <div className="bg-slate-950 p-5 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">
-              No objects currently detected on this feed.
+              Tidak ada objek yang terdeteksi pada feed ini saat ini.
             </div>
           ) : (
             <div className="flex flex-wrap gap-2">
@@ -362,15 +338,29 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
 
       <div className="col-span-1 space-y-6">
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 shadow-xl">
-          <div className="flex justify-between items-center mb-3">
-            <h2 className="text-sm font-semibold flex items-center gap-2 text-amber-400"><AlertTriangle size={16} /> Incident Verification Queue</h2>
-            <span className="text-xs bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full font-mono font-bold">{pendingIncidents.length} New</span>
+          <div className="flex justify-between items-center mb-2">
+            <h2 className="text-sm font-semibold flex items-center gap-2 text-amber-400"><AlertTriangle size={16} /> Antrean Verifikasi Insiden</h2>
+            <span className="text-xs bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full font-mono font-bold">{pendingIncidents.length} Baru</span>
           </div>
+          {pendingIncidents.length > 0 && (
+            <div className="flex items-center gap-1.5 mb-3 text-[10px] font-mono">
+              {pendingUrgencyCounts.critical > 0 && (
+                <span className="px-1.5 py-0.5 rounded border text-red-300 bg-red-950/50 border-red-800/40">{pendingUrgencyCounts.critical} critical</span>
+              )}
+              {pendingUrgencyCounts.warning > 0 && (
+                <span className="px-1.5 py-0.5 rounded border text-amber-300 bg-amber-950/50 border-amber-800/40">{pendingUrgencyCounts.warning} warning</span>
+              )}
+              {pendingUrgencyCounts.info > 0 && (
+                <span className="px-1.5 py-0.5 rounded border text-slate-400 bg-slate-800/60 border-slate-700">{pendingUrgencyCounts.info} info</span>
+              )}
+              <span className="text-slate-600">· diurutkan: kritis & terlama dulu</span>
+            </div>
+          )}
           <div className="space-y-3 max-h-[320px] overflow-y-auto pr-1">
-            {pendingIncidents.length === 0 ? (
-              <div className="bg-slate-950 p-6 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">No pending incidents requiring review.</div>
+            {sortedPending.length === 0 ? (
+              <div className="bg-slate-950 p-6 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">Tidak ada insiden yang menunggu review.</div>
             ) : (
-              pendingIncidents.map((incident) => {
+              sortedPending.map((incident) => {
                 const isEmergency = incident.eventType === 'EMERGENCY';
                 return (
                   <div key={incident.id} className={`bg-slate-950 border p-3.5 rounded-lg space-y-2.5 ${isEmergency ? 'border-orange-500/40' : 'border-amber-500/30'}`}>
@@ -399,8 +389,8 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
                       <span className="text-[11px] text-slate-300 flex items-center gap-1"><MapPin size={12} /> {incident.zone}</span>
                       <div className="flex gap-1.5">
                         <button onClick={() => handleDeleteIncident(incident.id)} title="Hapus (duplikat)" className="px-2 py-1 bg-slate-800 hover:bg-red-950/60 text-slate-500 hover:text-red-400 rounded text-xs flex items-center"><Trash2 size={13} /></button>
-                        <button onClick={() => handleVerifyIncident(incident.id, 'DISMISSED')} className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs flex items-center gap-1"><XCircle size={14} /> Dismiss</button>
-                        <button onClick={() => handleVerifyIncident(incident.id, 'CONFIRMED')} className="px-2.5 py-1 bg-red-600 hover:bg-red-500 text-white rounded text-xs flex items-center gap-1 font-semibold"><CheckCircle size={14} /> Confirm</button>
+                        <button onClick={() => handleVerifyIncident(incident.id, 'DISMISSED')} className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs flex items-center gap-1"><XCircle size={14} /> Tolak</button>
+                        <button onClick={() => handleVerifyIncident(incident.id, 'CONFIRMED')} className="px-2.5 py-1 bg-red-600 hover:bg-red-500 text-white rounded text-xs flex items-center gap-1 font-semibold"><CheckCircle size={14} /> Konfirmasi</button>
                       </div>
                     </div>
                   </div>
@@ -408,13 +398,18 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
               })
             )}
           </div>
+          {pendingIncidents.length > 6 && (
+            <Link to="/incidents" className="flex items-center justify-center gap-1.5 mt-3 pt-3 border-t border-slate-800 text-[11px] text-blue-400 hover:text-blue-300 font-semibold">
+              Kelola semua di halaman Insiden <ArrowRight size={12} />
+            </Link>
+          )}
         </div>
 
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 shadow-xl">
-          <h2 className="text-sm font-semibold flex items-center gap-2 mb-3 text-blue-400"><Bot size={16} /> AI Agent Activity</h2>
+          <h2 className="text-sm font-semibold flex items-center gap-2 mb-3 text-blue-400"><Bot size={16} /> Aktivitas AI Agent</h2>
           <div className="space-y-2.5 max-h-[200px] overflow-y-auto pr-1">
             {notifications.length === 0 ? (
-              <div className="bg-slate-950 p-5 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">Agent idle — no notifications dispatched.</div>
+              <div className="bg-slate-950 p-5 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">Agent idle — belum ada notifikasi dikirim.</div>
             ) : (
               notifications.map((n) => (
                 <div key={n.id} className={`bg-slate-950 border p-3 rounded-lg text-xs ${n.severity === 'critical' ? 'border-orange-500/40' : 'border-slate-800'}`}>
@@ -428,7 +423,7 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
                         ? 'text-emerald-400 border-emerald-800/50 bg-emerald-950/30'
                         : 'text-slate-500 border-slate-800 bg-slate-900'
                     }`}>
-                      {n.dispatched ? `SENT · ${(n.channel || 'EXTERNAL').toUpperCase()}` : 'LOCAL ONLY'}
+                      {n.dispatched ? `TERKIRIM · ${(n.channel || 'EXTERNAL').toUpperCase()}` : 'LOKAL SAJA'}
                     </span>
                   </div>
                   <p className="text-slate-300 leading-snug">{n.message}</p>
@@ -439,12 +434,17 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
         </div>
 
         <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 shadow-xl">
-          <h2 className="text-sm font-semibold flex items-center gap-2 mb-3 text-red-400"><ShieldAlert size={16} /> Confirmed Incident Registry</h2>
+          <div className="flex justify-between items-center mb-3">
+            <h2 className="text-sm font-semibold flex items-center gap-2 text-red-400"><ShieldAlert size={16} /> Daftar Insiden Terkonfirmasi</h2>
+            {sortedAwaitingAction.length > 0 && (
+              <span className="text-[10px] text-slate-500 font-mono">{sortedAwaitingAction.length} menunggu tindakan</span>
+            )}
+          </div>
           <div className="space-y-2.5 max-h-[320px] overflow-y-auto pr-1">
-            {verifiedIncidents.length === 0 ? (
-              <div className="bg-slate-950 p-5 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">No confirmed incidents yet.</div>
+            {sortedVerified.length === 0 ? (
+              <div className="bg-slate-950 p-5 rounded-lg text-center border border-slate-800 text-slate-500 text-xs">Belum ada insiden yang terkonfirmasi.</div>
             ) : (
-              verifiedIncidents.map((log) => (
+              sortedVerified.map((log) => (
                 <div key={log.id} className="bg-slate-950 border border-slate-800 p-3 rounded-lg text-xs">
                   <div className="flex justify-between items-center">
                     <div>
@@ -487,7 +487,13 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
               ))
             )}
           </div>
+          {verifiedIncidents.length > 6 && (
+            <Link to="/incidents" className="flex items-center justify-center gap-1.5 mt-3 pt-3 border-t border-slate-800 text-[11px] text-blue-400 hover:text-blue-300 font-semibold">
+              Kelola semua di halaman Insiden <ArrowRight size={12} />
+            </Link>
+          )}
         </div>
+      </div>
       </div>
     </div>
   );

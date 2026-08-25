@@ -1,5 +1,3 @@
-"""AI Agent endpoints: status, permission mode, chat sessions/messages, streaming chat,
-pending-action resolution, and direct action execution."""
 import json
 
 from fastapi import APIRouter
@@ -79,9 +77,6 @@ class ResolveActionRequest(BaseModel):
 
 @router.post("/api/agent/messages/{message_id}/resolve-action")
 def resolve_message_action(message_id: str, req: ResolveActionRequest):
-    """Records what happened to a proposed action directly on the chat message, so
-    reloading the session shows the real outcome instead of "Awaiting" forever. Shares the
-    same logic as the Discord confirm buttons via agent.resolve_pending_action()."""
     res = resolve_pending_action(message_id, req.approve)
     return {
         "status": "success" if res["ok"] else "error",
@@ -113,18 +108,12 @@ def _ensure_dashboard_session(session_id):
 
 @router.post("/api/agent/chat")
 def agent_chat(req: AgentChatRequest):
-    """Non-streaming variant. Kept for simple callers (curl/tests); the dashboard UI uses
-    /api/agent/chat/stream instead."""
     session_id = _ensure_dashboard_session(req.session_id)
     return run_agent_chat_session_final(session_id, req.text)
 
 
 @router.post("/api/agent/chat/stream")
 def agent_chat_stream(req: AgentChatRequest):
-    """Streaming variant (newline-delimited JSON) — the UI renders each step live as the
-    agent works: which tool it's calling, what it found, then the final reply/action.
-    First line is always a 'session' step so the client learns the session_id when a new
-    one was just created."""
     session_id = _ensure_dashboard_session(req.session_id)
 
     def generate():

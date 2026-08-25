@@ -33,8 +33,6 @@ function StepRow({ step }) {
       </div>
     );
   }
-  // Actions the agent ran on its own under accept-low-risk/auto permission mode — still
-  // needs to show up in the trail, or it looks like the reply changed something "by magic".
   if (step.step === 'action_call') {
     return (
       <div className="flex items-center gap-2 text-orange-400">

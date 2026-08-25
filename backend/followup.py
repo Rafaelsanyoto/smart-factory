@@ -1,15 +1,3 @@
-"""Follow-up on CONFIRMED incidents that still need a human to physically act.
-
-The autonomous agent only judges authenticity — it never marks an incident "handled". A
-real, confirmed incident sits in the awaiting-action set until a human records the actual
-remediation (web form, or a Discord ✅ reaction). Until then this module reminds them, with
-a cadence that escalates by urgency. A ❌ reaction / web dismissal on an agent-confirmed
-incident is captured as feedback: the AI's confirmation was wrong.
-
-This module is dependency-light on purpose (database / state / notifications only, never
-discord_bot or agent) so it can't create an import cycle. Discord delivery is injected via
-set_sender(); without a bot it falls back to the webhook (no reactions, but the web OVERDUE
-badge still covers acknowledgement)."""
 import os
 import threading
 import time
@@ -23,13 +11,13 @@ from .notifications import notify_action_taken, dispatch_message
 
 EVIDENCE_DIR = os.path.join(PROJECT_ROOT, "feedback_evidence")
 
-# Reminder cadence (seconds) per urgency. 'info' absent -> never reminded.
+# seconds per urgency tier; missing tier = never reminded
 REMINDER_CADENCE = {"critical": 120, "warning": 600}
 REMINDER_TICK = 20
 
-_reminded = {}            # event_id -> last-reminded epoch seconds
-_sender = None            # injected Discord sender: fn(event, text) -> bool (True if sent via bot)
-incident_messages = {}    # discord message_id -> event_id (for reaction handling)
+_reminded = {}
+_sender = None  # fn(event, text) -> bool, injected by discord_bot
+incident_messages = {}  # discord message_id -> event_id
 
 
 def set_sender(fn):
@@ -52,8 +40,6 @@ def _forget(event_id):
 
 
 def _save_feedback_image(event):
-    """Persist the evidence crop (if still in memory) so a wrong-confirmation feedback row
-    references a real labeled image."""
     data = state.event_crops.get(event["id"])
     if not data:
         return None
@@ -69,8 +55,6 @@ def _save_feedback_image(event):
 
 
 def mark_acted(event_id, note):
-    """Record remediation on a CONFIRMED incident — the shared core for the web form, the
-    agent's record_action tool, and the Discord ✅ reaction. Returns the updated event."""
     with engine_lock:
         ev = db_get_event(event_id)
         if not ev or ev["status"] != "CONFIRMED" or ev["action_taken"]:
@@ -84,9 +68,6 @@ def mark_acted(event_id, note):
 
 
 def dismiss_with_feedback(event_id, source, note):
-    """Dismiss an incident. If it was one the agent had confirmed as real, log it as an AI
-    mistake (with evidence) — this is the model-feedback signal. Shared by the web dismiss,
-    the agent's verify_incident(DISMISSED), and the Discord ❌ reaction."""
     with engine_lock:
         ev = db_get_event(event_id)
         if not ev or ev["status"] == "DELETED":
@@ -111,8 +92,10 @@ def _due(event, now):
 
 
 def _send_reminder(event):
+    mention = state.responsible_mention_for(event["stream_id"])
+    prefix = f"{mention}\n" if mention else ""
     text = (
-        f"🔔 **BELUM DITINDAK — #{event.get('seq', '?')}** ({str(event.get('urgency', '?')).upper()})\n"
+        f"{prefix}🔔 **BELUM DITINDAK — #{event.get('seq', '?')}** ({str(event.get('urgency', '?')).upper()})\n"
         f"• **Zona:** {event['zone']}\n"
         f"• **Jenis:** {event['class']}\n"
         f"• **Terdeteksi:** {event['timestamp']}\n"
@@ -125,7 +108,7 @@ def _send_reminder(event):
         except Exception as e:
             print(f"[REMINDER] sender error: {e}")
     if not sent:
-        dispatch_message(text, purpose="action")  # webhook fallback (no reactions)
+        dispatch_message(text, purpose="action")
     print(f"[REMINDER] #{event.get('seq', '?')} ({event.get('urgency')}) diingatkan via {'bot' if sent else 'webhook'}")
 
 

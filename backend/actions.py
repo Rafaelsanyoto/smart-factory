@@ -1,15 +1,10 @@
-"""Action helpers — the single source of truth for every state change, shared by the REST
-routes AND the AI Agent's confirmed actions, so both paths behave identically and validate
-the same way. Each apply_* updates the in-memory mirror in state.py AND persists to the DB
-(where relevant) so the change survives a restart.
+import re
 
-Also holds the read-payload builders (zones_payload / sources_payload) that both the REST
-endpoints and the agent's read tools return, so their shape stays identical."""
 from .config import (
     MODEL_REGISTRY, ALL_CLASSES, URGENCY_LEVELS, PERMISSION_MODES,
     stream_source_tokens, list_video_files, resolve_source,
 )
-from .database import engine_lock, db_save_config, db_save_zone_classes
+from .database import engine_lock, db_save_config, db_save_zone_classes, db_save_zone_responsible
 from . import state
 from .camera import cameras
 
@@ -34,9 +29,6 @@ def apply_confidence(value):
 
 
 def apply_zone_classes(stream_id, classes):
-    """Update a zone's per-class config. `classes` maps class_name -> any subset of
-    {display, monitor, urgency}; changes are merged onto the existing config so partial
-    updates (e.g. just toggling monitor for one class) work."""
     if stream_id not in state.ZONE_RULES:
         return {"status": "error", "message": "unknown zone"}
     current = state.ZONE_RULES[stream_id].get("classes", {})
@@ -55,6 +47,18 @@ def apply_zone_classes(stream_id, classes):
     with engine_lock:
         db_save_zone_classes(stream_id, state.ZONE_RULES[stream_id]["label"], current)
     return {"status": "success", "stream_id": stream_id, "classes": current}
+
+
+def apply_zone_responsible(stream_id, name, mention):
+    if stream_id not in state.ZONE_RULES:
+        return {"status": "error", "message": "unknown zone"}
+    name = (name or "").strip() or None
+    mention = re.sub(r"\D", "", mention or "") or None  # keep digits only, e.g. pasted <@id>
+    state.ZONE_RULES[stream_id]["responsible_name"] = name
+    state.ZONE_RULES[stream_id]["responsible_mention"] = mention
+    with engine_lock:
+        db_save_zone_responsible(stream_id, name, mention)
+    return {"status": "success", "stream_id": stream_id, "responsible_name": name, "responsible_mention": mention}
 
 
 def apply_autonomous_mode(enabled):
@@ -93,13 +97,18 @@ def apply_permission_mode(mode):
     return {"status": "success", "mode": mode}
 
 
-# --- read-payload builders (shared by REST routes + agent read tools) ---------------
 def zones_payload():
     return {
         "all_classes": ALL_CLASSES,
         "urgency_levels": list(URGENCY_LEVELS),
         "zones": [
-            {"stream_id": sid, "label": rule["label"], "classes": rule.get("classes", {})}
+            {
+                "stream_id": sid,
+                "label": rule["label"],
+                "classes": rule.get("classes", {}),
+                "responsible_name": rule.get("responsible_name"),
+                "responsible_mention": rule.get("responsible_mention"),
+            }
             for sid, rule in state.ZONE_RULES.items()
         ],
     }

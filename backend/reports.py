@@ -1,6 +1,3 @@
-"""Report file generation — turns incident data into a real downloadable file (PDF / XLSX /
-CSV), not just text to copy-paste. Used by the agent's export_report tool; the file is
-served for download (web) or attached to the message (Discord)."""
 import csv
 import os
 import time
@@ -192,7 +189,6 @@ def _to_pdf(path, events, summary):
 
 
 def generate_report_file(fmt="pdf", since_hours=24, zone=""):
-    """Generate a report file. Returns {status, filename, path, format} or an error dict."""
     fmt = str(fmt).lower().strip()
     if fmt in ("excel", "xls"):
         fmt = "xlsx"

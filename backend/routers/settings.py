@@ -1,4 +1,3 @@
-"""Health, DB info, model/confidence, per-zone class rules, and autonomous-mode endpoints."""
 import os
 
 from fastapi import APIRouter
@@ -7,7 +6,10 @@ from pydantic import BaseModel
 from ..config import MODEL_REGISTRY, DB_PATH
 from ..database import db_conn, engine_lock, db_feedback_summary
 from .. import state
-from ..actions import apply_model, apply_confidence, apply_zone_classes, apply_autonomous_mode, zones_payload
+from ..actions import (
+    apply_model, apply_confidence, apply_zone_classes, apply_zone_responsible,
+    apply_autonomous_mode, zones_payload,
+)
 
 router = APIRouter()
 
@@ -71,6 +73,16 @@ class ZoneClassesUpdate(BaseModel):
 @router.post("/api/zones/{stream_id}")
 def update_zone(stream_id: str, req: ZoneClassesUpdate):
     return apply_zone_classes(stream_id, req.classes)
+
+
+class ZoneResponsibleSet(BaseModel):
+    name: str = ""
+    mention: str = ""
+
+
+@router.post("/api/zones/{stream_id}/responsible")
+def update_zone_responsible(stream_id: str, req: ZoneResponsibleSet):
+    return apply_zone_responsible(stream_id, req.name, req.mention)
 
 
 @router.get("/api/system/autonomous")

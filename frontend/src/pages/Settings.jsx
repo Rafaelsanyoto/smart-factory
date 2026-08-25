@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react';
 import {
   Sliders, Camera, Database, Save, Server, Shield, Cpu, Video, Info, WifiOff, Pause, Play,
-  Eye, EyeOff, Crosshair, Bot, ShieldCheck, Zap, ShieldAlert, Radar,
+  Eye, EyeOff, Crosshair, Bot, ShieldCheck, Zap, ShieldAlert, Radar, UserRound,
 } from 'lucide-react';
 
-// Full static Tailwind class strings (not interpolated) so the JIT scanner picks them up.
+// static classes (JIT scanner needs literal strings, not interpolated)
 const PERMISSION_MODE_META = {
   standard: {
     label: 'Standard',
@@ -29,7 +29,6 @@ const PERMISSION_MODE_META = {
   },
 };
 
-// Urgency tier -> static Tailwind classes for the per-class dropdown accent.
 const URGENCY_CLASS = {
   info: 'text-slate-400 border-slate-700',
   warning: 'text-amber-300 border-amber-600/50',
@@ -37,6 +36,47 @@ const URGENCY_CLASS = {
 };
 
 const API_BASE = 'http://127.0.0.1:8000';
+
+function ResponsibleFields({ zone, onSave, disabled }) {
+  const [name, setName] = useState(zone.responsible_name || '');
+  const [mention, setMention] = useState(zone.responsible_mention || '');
+  const [dirty, setDirty] = useState(false);
+
+  return (
+    <div className="space-y-1.5">
+      <label className="text-[10px] font-semibold text-slate-500 uppercase flex items-center gap-1">
+        <UserRound size={11} /> Penanggung Jawab Zona
+      </label>
+      <div className="flex gap-1.5">
+        <input
+          value={name}
+          onChange={(e) => { setName(e.target.value); setDirty(true); }}
+          placeholder="Nama, mis. Budi (Supervisor)"
+          disabled={disabled}
+          className="flex-1 bg-slate-900 border border-slate-700 text-slate-200 text-[11px] rounded px-2 py-1.5 disabled:opacity-50"
+        />
+        <input
+          value={mention}
+          onChange={(e) => { setMention(e.target.value.replace(/\D/g, '')); setDirty(true); }}
+          placeholder="ID Discord, mis. 391847583920123456"
+          inputMode="numeric"
+          disabled={disabled}
+          className="w-40 bg-slate-900 border border-slate-700 text-slate-200 text-[11px] font-mono rounded px-2 py-1.5 disabled:opacity-50"
+        />
+        <button
+          onClick={() => { onSave(name, mention); setDirty(false); }}
+          disabled={disabled || !dirty}
+          className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-30 text-white rounded text-[11px] font-semibold"
+        >
+          Simpan
+        </button>
+      </div>
+      <p className="text-[9px] text-slate-600">
+        Cukup masukkan angka ID Discord-nya saja (tidak perlu format). Cara ambil: aktifkan Developer Mode di Discord → klik kanan orangnya → Copy User ID.
+      </p>
+    </div>
+  );
+}
 
 export default function Configuration() {
   const [models, setModels] = useState([]);
@@ -64,7 +104,6 @@ export default function Configuration() {
     if (ms) setTimeout(() => setter(''), ms);
   };
 
-  // Load current backend configuration
   useEffect(() => {
     (async () => {
       try {
@@ -107,7 +146,7 @@ export default function Configuration() {
     const prev = activeModel;
     setActiveModel(id);
     const label = models.find((m) => m.id === id)?.label || id;
-    setModelStatus(`Switching to ${label}… reloading weights on edge node.`);
+    setModelStatus(`Mengganti ke ${label}… memuat ulang model.`);
     try {
       const res = await fetch(`${API_BASE}/api/model/select`, {
         method: 'POST',
@@ -115,31 +154,29 @@ export default function Configuration() {
         body: JSON.stringify({ id }),
       });
       const data = await res.json();
-      if (data.status === 'success') flash(setModelStatus, `Model active: ${label}.`);
-      else { setActiveModel(prev); flash(setModelStatus, 'Model switch failed.'); }
+      if (data.status === 'success') flash(setModelStatus, `Model aktif: ${label}.`);
+      else { setActiveModel(prev); flash(setModelStatus, 'Gagal mengganti model.'); }
     } catch {
       setActiveModel(prev);
-      flash(setModelStatus, 'Model switch failed — backend offline.');
+      flash(setModelStatus, 'Gagal mengganti model — backend offline.');
     }
   };
 
   const handleSave = async (e) => {
     e.preventDefault();
-    setSaveStatus('Syncing thresholds to edge node…');
+    setSaveStatus('Menyimpan confidence threshold…');
     try {
       await fetch(`${API_BASE}/api/config/confidence`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ confidence }),
       });
-      flash(setSaveStatus, 'Configuration synced successfully.', 4000);
+      flash(setSaveStatus, 'Pengaturan berhasil disimpan.', 4000);
     } catch {
-      flash(setSaveStatus, 'Sync failed — backend offline.', 4000);
+      flash(setSaveStatus, 'Gagal menyimpan — backend offline.', 4000);
     }
   };
 
-  // Merge a partial change into one class of one zone (display/monitor/urgency), optimistic
-  // with rollback on failure.
   const updateZoneClass = async (streamId, className, patch) => {
     const zone = zones.find((z) => z.stream_id === streamId);
     const before = zone?.classes?.[className];
@@ -162,6 +199,21 @@ export default function Configuration() {
     }
   };
 
+  const updateZoneResponsible = async (streamId, name, mention) => {
+    setZones((prev) => prev.map((z) =>
+      z.stream_id === streamId ? { ...z, responsible_name: name, responsible_mention: mention } : z));
+    try {
+      await fetch(`${API_BASE}/api/zones/${streamId}/responsible`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, mention }),
+      });
+      flash(setSaveStatus, `Penanggung jawab zona diperbarui.`);
+    } catch {
+      flash(setSaveStatus, 'Update gagal — backend offline.');
+    }
+  };
+
   const togglePause = async (streamId) => {
     const next = !sources.paused[streamId];
     setSources((prev) => ({ ...prev, paused: { ...prev.paused, [streamId]: next } }));
@@ -171,10 +223,10 @@ export default function Configuration() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ paused: next }),
       });
-      flash(setSaveStatus, `${streamId} ${next ? 'paused' : 'resumed'}.`);
+      flash(setSaveStatus, `${streamId} ${next ? 'dijeda' : 'dilanjutkan'}.`);
     } catch {
       setSources((prev) => ({ ...prev, paused: { ...prev.paused, [streamId]: !next } }));
-      flash(setSaveStatus, 'Pause toggle failed — backend offline.');
+      flash(setSaveStatus, 'Gagal mengubah status jeda — backend offline.');
     }
   };
 
@@ -222,9 +274,9 @@ export default function Configuration() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source }),
       });
-      flash(setSaveStatus, `Source updated for ${streamId}.`);
+      flash(setSaveStatus, `Sumber untuk ${streamId} diperbarui.`);
     } catch {
-      flash(setSaveStatus, 'Source update failed — backend offline.');
+      flash(setSaveStatus, 'Gagal mengubah sumber — backend offline.');
     }
   };
 
@@ -234,21 +286,21 @@ export default function Configuration() {
       <div className="flex justify-between items-end mb-6">
         <div>
           <h1 className="text-xl font-bold text-white flex items-center gap-2">
-            <Sliders size={20} className="text-blue-400" /> System Configuration
+            <Sliders size={20} className="text-blue-400" /> Konfigurasi Sistem
           </h1>
-          <p className="text-xs text-slate-400 mt-1">Kelola parameter edge node, model deteksi, dan aturan kelas per zona.</p>
+          <p className="text-xs text-slate-400 mt-1">Kelola model deteksi, confidence, dan aturan kelas per zona.</p>
         </div>
         <button
           onClick={handleSave}
           className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-md text-sm font-bold flex items-center gap-2 transition-colors"
         >
-          <Save size={16} /> Sync Thresholds
+          <Save size={16} /> Simpan Pengaturan
         </button>
       </div>
 
       {offline && (
         <div className="bg-red-950/50 border border-red-500/50 text-red-400 text-xs font-mono p-3 rounded-lg flex items-center gap-2">
-          <WifiOff size={14} /> Backend offline — configuration cannot be loaded or applied. Start api.py.
+          <WifiOff size={14} /> Backend offline — pengaturan tidak bisa dimuat atau diterapkan. Jalankan api.py.
         </div>
       )}
       {saveStatus && (
@@ -262,12 +314,12 @@ export default function Configuration() {
         <div className="space-y-6">
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl space-y-6">
             <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2 border-b border-slate-800 pb-3">
-              <Shield size={16} className="text-emerald-400" /> Vision Model Parameters
+              <Shield size={16} className="text-emerald-400" /> Parameter Model Deteksi
             </h2>
 
             <div>
               <label className="text-xs font-semibold text-slate-400 uppercase flex items-center gap-1.5 mb-2">
-                <Cpu size={13} className="text-blue-400" /> Detection Model
+                <Cpu size={13} className="text-blue-400" /> Model Deteksi
               </label>
               <select
                 value={activeModel}
@@ -285,7 +337,7 @@ export default function Configuration() {
 
             <div>
               <div className="flex justify-between items-center mb-2">
-                <label className="text-xs font-semibold text-slate-400 uppercase">Detection Confidence Threshold</label>
+                <label className="text-xs font-semibold text-slate-400 uppercase">Confidence Threshold Deteksi</label>
                 <span className="text-xs bg-slate-950 px-2 py-1 rounded border border-slate-700 font-mono text-blue-400">
                   {(confidence * 100).toFixed(0)}%
                 </span>
@@ -300,7 +352,7 @@ export default function Configuration() {
                 disabled={offline}
                 className="w-full accent-blue-500 disabled:opacity-50"
               />
-              <p className="text-[11px] text-slate-500 mt-2">Threshold lebih tinggi mengurangi false positive tapi bisa melewatkan pelanggaran parsial. Diterapkan saat Sync.</p>
+              <p className="text-[11px] text-slate-500 mt-2">Threshold lebih tinggi mengurangi false positive tapi bisa melewatkan pelanggaran parsial. Diterapkan saat disimpan.</p>
             </div>
           </div>
 
@@ -352,7 +404,7 @@ export default function Configuration() {
           {/* AI Agent permission mode */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl">
             <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
-              <Bot size={16} className="text-blue-400" /> AI Agent Permission Mode
+              <Bot size={16} className="text-blue-400" /> Mode Izin AI Agent
             </h2>
             <div className="space-y-2">
               {permissionOptions.map((mode) => {
@@ -385,7 +437,7 @@ export default function Configuration() {
           {/* SQLite */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-xl">
             <h2 className="text-sm font-semibold text-slate-200 flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
-              <Database size={16} className="text-purple-400" /> Local Persistence (SQLite)
+              <Database size={16} className="text-purple-400" /> Penyimpanan Lokal (SQLite)
             </h2>
             {dbInfo ? (
               <div className="grid grid-cols-2 gap-3 text-xs">
@@ -421,7 +473,7 @@ export default function Configuration() {
 
             <div className="space-y-4">
               {zones.length === 0 && (
-                <p className="text-xs text-slate-500">No streams available.</p>
+                <p className="text-xs text-slate-500">Belum ada stream yang tersedia.</p>
               )}
               {zones.map((zone) => (
                 <div key={zone.stream_id} className="bg-slate-950 p-3.5 rounded-lg border border-slate-800 space-y-3">
@@ -439,13 +491,13 @@ export default function Configuration() {
                           : 'bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200'
                       }`}
                     >
-                      {sources.paused[zone.stream_id] ? <><Play size={11} /> Resume</> : <><Pause size={11} /> Pause</>}
+                      {sources.paused[zone.stream_id] ? <><Play size={11} /> Lanjutkan</> : <><Pause size={11} /> Jeda</>}
                     </button>
                   </div>
 
                   <div>
                     <label className="text-[10px] font-semibold text-slate-500 uppercase flex items-center gap-1 mb-1">
-                      <Video size={11} /> Source
+                      <Video size={11} /> Sumber
                     </label>
                     <select
                       value={sources.current[zone.stream_id] || ''}
@@ -458,6 +510,12 @@ export default function Configuration() {
                       ))}
                     </select>
                   </div>
+
+                  <ResponsibleFields
+                    zone={zone}
+                    disabled={offline}
+                    onSave={(name, mention) => updateZoneResponsible(zone.stream_id, name, mention)}
+                  />
 
                   {/* Per-class matrix: display / monitor / urgency */}
                   <div>

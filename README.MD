@@ -1,4 +1,4 @@
-# Smart Factory HSE Command Dashboard
+# SafeSight AI — Smart Factory HSE Command Dashboard
 
 Autonomous Safety Surveillance & Incident Workflow system for AI Innovation Challenge (AIC) COMPFEST 18, Smart Manufacturing track — real-time YOLO-based PPE compliance & fire/smoke detection, a server-side rule engine with full incident lifecycle tracking, an AI Agent (Gemini function calling), and a FastAPI + React dashboard.
 

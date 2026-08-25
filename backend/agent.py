@@ -1,8 +1,3 @@
-"""AI Agent — conversational assistant with Gemini function calling. READ tools always run
-inline (safe). ACTION tools are gated by the permission mode: in 'standard' they're returned
-to the UI as a pending action a human confirms; in 'accept_low_risk' the low-risk ones run
-inline; in 'auto' everything runs inline. Chat history is persisted per session so it
-survives restarts and gives the Discord bot real multi-turn memory."""
 import threading
 import time
 
@@ -20,8 +15,7 @@ from .notifications import dispatch_message
 
 REPORT_URL_BASE = "http://127.0.0.1:8000/api/reports/file"
 
-# Report files generated during the CURRENT chat turn — collected per-thread so the caller
-# (streaming UI / Discord bot) can offer a download button / attach the file.
+# report files generated in the current chat turn, per-thread
 _turn = threading.local()
 
 
@@ -31,9 +25,6 @@ def _turn_report_files():
     return _turn.files
 
 
-# ---------------------------------------------------------------------------
-# Tool implementations
-# ---------------------------------------------------------------------------
 def _agent_get_events(zone="", violation_class="", event_type="", since_minutes=0, status=""):
     query = "SELECT * FROM events WHERE 1=1"
     params = []
@@ -105,9 +96,7 @@ def _agent_verify_incident(seq, status):
     ev = _find_event_by_seq(seq)
     if not ev:
         return {"status": "error", "message": f"insiden #{seq} tidak ditemukan"}
-    # A chat-initiated verify is a HUMAN decision routed through the agent — don't tag it
-    # verified_by="agent" (that marker is reserved for autonomous confirmations, so the
-    # feedback/accuracy metric stays meaningful). Dismissal still routes through followup.
+    # chat-initiated verify is a human decision, not tagged verified_by="agent"
     if status == "DISMISSED":
         updated = followup.dismiss_with_feedback(ev["id"], "agent", "Ditolak via AI Agent (perintah user)")
     else:
@@ -125,7 +114,7 @@ def _agent_record_action(seq, note):
         return {"status": "error", "message": f"insiden #{seq} tidak ditemukan"}
     if ev["status"] != "CONFIRMED":
         return {"status": "error", "message": f"hanya insiden CONFIRMED yang bisa dicatat tindakannya (#{seq} berstatus {ev['status']})"}
-    updated = followup.mark_acted(ev["id"], note)  # shared with web form + Discord ✅
+    updated = followup.mark_acted(ev["id"], note)
     return {"status": "success", "message": f"Tindakan untuk insiden #{seq} dicatat.", "event": updated}
 
 
@@ -151,8 +140,6 @@ def _agent_export_report(file_format="pdf", since_hours=24, zone=""):
 
 
 def _apply_zone_classes_from_updates(stream_id, updates):
-    """Convert the agent's array-of-objects form into the {class: {...}} dict apply_zone_classes
-    expects (Gemini function calling handles arrays of objects better than open-keyed maps)."""
     classes = {}
     for u in (updates or []):
         name = u.get("class_name")
@@ -163,8 +150,6 @@ def _apply_zone_classes_from_updates(stream_id, updates):
 
 
 def _agent_generate_report(since_hours=24, zone=""):
-    """Aggregated stats over a time window — richer material for the agent to write a
-    coherent narrative report from, instead of just a flat list of raw events."""
     try:
         since_hours = float(since_hours or 24)
     except (TypeError, ValueError):
@@ -242,33 +227,21 @@ ACTION_TOOLS = {
     "record_action": lambda seq, note: _agent_record_action(seq, note),
 }
 
-# Risk tier per action tool, used by the permission-mode auto-run decision below.
-# "low": can't affect what gets detected as a violation/emergency, and is easily reversible
-# — safe to auto-run under accept_low_risk.
-# "high": changes actual detection behavior (what's monitored, how sensitive, source/model,
-# camera on/off, how autonomous the agent itself is) — a misinterpreted command here could
-# mean a real violation or emergency goes undetected, so it stays gated behind confirmation
-# unless the operator has explicitly opted into Full Auto.
 ACTION_RISK = {
     "send_alert_message": "low",
-    "record_action": "low",       # documenting remediation on an already-CONFIRMED incident
+    "record_action": "low",
     "set_zone_classes": "high",
     "set_confidence": "high",
     "set_stream_paused": "high",
     "set_stream_source": "high",
     "select_model": "high",
     "set_autonomous_mode": "high",
-    "verify_incident": "high",     # can flip an incident to DISMISSED — must be confirmed
-    # High even though it's "just" a settings toggle — changing this decides how
-    # autonomous FUTURE actions become, so it defaults to needing confirmation too.
-    # Only auto-runs itself once already in "auto" mode.
+    "verify_incident": "high",
     "set_agent_permission_mode": "high",
 }
 
 
 def _action_auto_runs(tool_name):
-    """Whether the current permission mode allows this action tool to execute without
-    a human confirm click."""
     if state.agent_permission_mode == "auto":
         return True
     if state.agent_permission_mode == "accept_low_risk":
@@ -498,8 +471,6 @@ def describe_action(name, args):
 
 
 def _summarize_tool_result(name, result):
-    """Short human-readable summary of a read-tool's result, shown live in the UI —
-    not the raw JSON, just enough to say what the agent found."""
     try:
         if name == "get_events":
             return f"{result['count']} event ditemukan"
@@ -538,10 +509,6 @@ TOOL_LABELS = {
 
 
 def run_agent_chat_steps(history):
-    """Generator: yields step dicts live as the agent reasons/calls tools, ending with
-    a 'final' (or 'action_proposed'/'error'/'not_configured') step. Shared by both the
-    streaming endpoint (yields each step to the UI) and the plain endpoint (drains this
-    generator and returns only the last step, for simple non-streaming callers)."""
     if not GEMINI_API_KEY:
         yield {
             "step": "not_configured",
@@ -570,7 +537,7 @@ def run_agent_chat_steps(history):
             contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
 
     try:
-        for round_num in range(6):  # bounded tool-calling loop
+        for round_num in range(6):
             yield {"step": "thinking", "round": round_num + 1}
             resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
             calls = list(resp.function_calls or [])
@@ -579,9 +546,6 @@ def run_agent_chat_steps(history):
                 yield {"step": "final", "configured": True, "reply": (resp.text or "").strip(), "pending_action": None}
                 return
 
-            # If any action call in this round still needs a human click under the
-            # current permission mode, stop and propose it — don't partially execute
-            # some calls while asking about another in the same round.
             needs_confirm = next(
                 (c for c in calls if c.name in ACTION_TOOLS and not _action_auto_runs(c.name)), None,
             )
@@ -600,9 +564,6 @@ def run_agent_chat_steps(history):
                 }
                 return
 
-            # Every call this round is either a read tool, or an action tool the current
-            # permission mode allows to run without confirmation — execute inline and
-            # feed the results back so Gemini can produce a final reply referencing them.
             contents.append(resp.candidates[0].content)
             parts = []
             for c in calls:
@@ -638,13 +599,7 @@ def run_agent_chat_steps(history):
 
 
 def run_agent_chat_session(session_id, user_text):
-    """Wraps run_agent_chat_steps with DB persistence: saves the incoming user message,
-    loads the FULL session history from the DB (source of truth, not client-supplied) to
-    build Gemini's context, runs the normal tool-calling loop, then saves the agent's
-    final reply — together with its full step trail — back to the session. Yields the
-    same step stream as run_agent_chat_steps, so both streaming and non-streaming callers
-    (dashboard UI, plain HTTP, Discord bot) work exactly as before at the call site."""
-    _turn.files = []  # reset per-turn report collector
+    _turn.files = []
     with engine_lock:
         db_insert_message(session_id, "user", user_text)
         session = db_get_session(session_id)
@@ -672,9 +627,6 @@ def run_agent_chat_session(session_id, user_text):
                 session_id, "agent", final_step.get("reply", ""),
                 steps=collected_steps, pending_action=final_step.get("pending_action"),
             )
-        # Emit the persisted message id (so callers can resolve its pending action against
-        # the real DB row) plus any report files generated this turn (for a download button
-        # / Discord attachment).
         yield {
             "step": "saved",
             "agent_message_id": agent_message_id,
@@ -687,8 +639,6 @@ _TERMINAL_STEPS = ("final", "action_proposed", "error", "not_configured")
 
 
 def run_agent_chat_session_final(session_id, user_text):
-    """Drains the step generator, returns the meaningful final step plus the persisted
-    agent_message_id and session_id. Used by the plain HTTP endpoint and the Discord bot."""
     result = {"configured": False, "reply": "", "pending_action": None}
     agent_message_id = None
     turn_reports = []
@@ -706,9 +656,6 @@ def run_agent_chat_session_final(session_id, user_text):
 
 
 def resolve_pending_action(message_id, approve):
-    """Execute or cancel a message's pending action, recording the outcome on the message
-    (state: done/failed/cancelled). Shared by the web resolve endpoint AND the Discord
-    confirm buttons so both behave identically. Returns {ok, message, pending_action}."""
     with engine_lock:
         msg = db_get_message(message_id)
         if not msg:

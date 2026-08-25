@@ -1,4 +1,3 @@
-"""Video streaming + source/pause control endpoints."""
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel

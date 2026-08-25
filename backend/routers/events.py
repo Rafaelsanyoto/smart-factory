@@ -1,5 +1,3 @@
-"""Incident lifecycle endpoints: list events, verify (confirm/dismiss), record remediation
-action, delete-as-duplicate, and the notification log. One violation, one final outcome."""
 import time
 
 from fastapi import APIRouter
@@ -19,14 +17,11 @@ def get_events():
 
 
 class EventVerify(BaseModel):
-    status: str  # "CONFIRMED" | "DISMISSED"
+    status: str
 
 
 @router.post("/api/events/{event_id}/verify")
 def verify_event(event_id: str, req: EventVerify):
-    """Admin marks a PENDING incident as a real violation (CONFIRMED) or a false
-    detection (DISMISSED). This is the step that makes the incident queryable by the AI
-    Agent and eligible to have a remediation action recorded against it."""
     status = req.status.upper()
     if status not in ("CONFIRMED", "DISMISSED"):
         return {"status": "error", "message": "status harus CONFIRMED atau DISMISSED"}
@@ -34,8 +29,6 @@ def verify_event(event_id: str, req: EventVerify):
         event = db_get_event(event_id)
         if not event:
             return {"status": "error", "message": "event tidak ditemukan"}
-    # DISMISSED goes through followup so a dismissal of an agent-confirmed incident is
-    # captured as AI feedback; CONFIRMED is a straight status update.
     if status == "DISMISSED":
         result = followup.dismiss_with_feedback(event_id, "web", "Ditolak admin (salah deteksi)")
     else:
@@ -50,9 +43,6 @@ class EventAction(BaseModel):
 
 @router.post("/api/events/{event_id}/action")
 def record_action(event_id: str, req: EventAction):
-    """Admin records what remediation was taken on a CONFIRMED incident. Completes the
-    tracking cycle: PENDING -> CONFIRMED -> action taken/note — all queryable by the
-    AI Agent, and dispatches a notification to the 'action' channel."""
     note_text = req.action_note.strip()
     if not note_text:
         return {"status": "error", "message": "catatan tindakan tidak boleh kosong"}
@@ -62,7 +52,7 @@ def record_action(event_id: str, req: EventAction):
             return {"status": "error", "message": "event tidak ditemukan"}
         if event["status"] != "CONFIRMED":
             return {"status": "error", "message": "hanya insiden berstatus CONFIRMED yang bisa dicatat tindakannya"}
-    result = followup.mark_acted(event_id, note_text)  # shared with Discord ✅ + agent tool
+    result = followup.mark_acted(event_id, note_text)
     return {"status": "success", "event": result}
 
 
@@ -72,11 +62,6 @@ class EventDelete(BaseModel):
 
 @router.post("/api/events/{event_id}/delete")
 def delete_event(event_id: str, req: EventDelete):
-    """Admin deletes an incident — typically a duplicate (e.g. the same physical event
-    got split into two episodes). Not a silent removal: it's still logged as that
-    incident's final outcome (status DELETED + reason), so every violation ends up with
-    exactly one documented resolution — either a real action taken, or a deletion here.
-    Works from any status except an already-deleted incident."""
     reason = (req.reason or "Duplikat").strip() or "Duplikat"
     with engine_lock:
         event = db_get_event(event_id)
@@ -97,3 +82,13 @@ def delete_event(event_id: str, req: EventDelete):
 def get_notifications():
     with engine_lock:
         return {"status": "success", "notifications": db_get_notifications()}
+
+
+@router.post("/api/events/{event_id}/acknowledge")
+def acknowledge_event(event_id: str):
+    with engine_lock:
+        event = db_get_event(event_id)
+        if not event:
+            return {"status": "error", "message": "event tidak ditemukan"}
+        result = db_update_event(event_id, alarm_ack_at=time.strftime("%H:%M:%S"))
+    return {"status": "success", "event": result}
