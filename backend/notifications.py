@@ -1,5 +1,4 @@
 import json
-import threading
 import urllib.request
 import uuid
 
@@ -25,7 +24,6 @@ def format_notification(event):
         f"{icon} **{header}**",
         f"• **Insiden:** #{event.get('seq', '?')}",
         f"• **Urgensi:** {urgency.upper()}",
-        f"• **Zona:** {event['zone']}",
         f"• **Jenis:** {event['class']}",
         f"• **Waktu:** {event['timestamp']}",
         f"• **Confidence:** {_pct(event.get('confidence'))}",
@@ -34,33 +32,10 @@ def format_notification(event):
     return "\n".join(lines), urgency
 
 
-def format_batch_notification(batch_events):
-    has_emergency = any(e["type"] == "EMERGENCY" for e in batch_events)
-    urgencies = [e.get("urgency", "warning") for e in batch_events]
-    top_urgency = "critical" if "critical" in urgencies else ("warning" if "warning" in urgencies else "info")
-    icon = URGENCY_ICON.get(top_urgency, "⚠️")
-    header = f"{len(batch_events)} KEJADIAN TERDETEKSI BERSAMAAN"
-    action = "Segera evakuasi & hubungi tim darurat" if has_emergency else "Menunggu tindakan tim safety"
-
-    by_zone = {}
-    for e in batch_events:
-        by_zone.setdefault(e["zone"], []).append(e)
-
-    seq_list = ", ".join(f"#{e.get('seq', '?')}" for e in batch_events)
-    lines = [f"{icon} **{header}**", f"• **Insiden:** {seq_list}"]
-    for zone, evs in by_zone.items():
-        items = ", ".join(f"{e['class']} (#{e.get('seq', '?')}, {_pct(e.get('confidence'))})" for e in evs)
-        lines.append(f"• **{zone}:** {items}")
-    lines.append(f"• **Waktu:** {batch_events[0]['timestamp']}")
-    lines.append(f"• **Status:** {action}")
-    return "\n".join(lines), top_urgency
-
-
 def format_action_notification(event):
     lines = [
         "✅ **TINDAKAN DICATAT**",
         f"• **Insiden:** #{event.get('seq', '?')}",
-        f"• **Zona:** {event['zone']}",
         f"• **Jenis Pelanggaran:** {event['class']}",
         f"• **Waktu Kejadian:** {event['timestamp']}",
         f"• **Tindakan:** {event['action_note']}",
@@ -69,27 +44,10 @@ def format_action_notification(event):
     return "\n".join(lines)
 
 
-def format_ai_confirmed_notification(event, mention=None):
-    lines = []
-    if mention:
-        lines.append(mention)
-    lines += [
-        "🤖 **DIKONFIRMASI AI — PERLU TINDAKAN**",
-        f"• **Insiden:** #{event.get('seq', '?')}",
-        f"• **Zona:** {event['zone']}",
-        f"• **Jenis:** {event['class']}",
-        f"• **Waktu:** {event['timestamp']}",
-        f"• **Alasan AI:** {event.get('agent_reasoning') or '-'}",
-        "• **Status:** Menunggu tindakan — catat penyelesaiannya di dashboard.",
-    ]
-    return "\n".join(lines)
-
-
 def format_delete_notification(event):
     lines = [
         "🗑️ **INSIDEN DIHAPUS**",
         f"• **Insiden:** #{event.get('seq', '?')}",
-        f"• **Zona:** {event['zone']}",
         f"• **Jenis Pelanggaran:** {event['class']}",
         f"• **Waktu Kejadian:** {event['timestamp']}",
         f"• **Alasan:** {event['delete_reason']}",
@@ -118,7 +76,6 @@ def _multipart_body(text, images):
 def send_discord(text, webhook_url, images=None):
     if not webhook_url:
         return False
-    # custom User-Agent required, Discord rejects the default urllib one
     headers = {"User-Agent": "SmartFactoryHSE/1.0"}
     if images:
         body, boundary = _multipart_body(text, images)
@@ -151,41 +108,6 @@ def dispatch_message(text, purpose="detection", images=None):
     return False, None
 
 
-BATCH_WINDOW_SECONDS = 2.0
-_batch_lock = threading.Lock()
-_batch_pending = []
-_batch_timer = None
-
-
-def _flush_batch():
-    global _batch_timer
-    with _batch_lock:
-        batch = _batch_pending[:]
-        _batch_pending.clear()
-        _batch_timer = None
-
-    if not batch:
-        return
-
-    batch_events = [e for e, _ in batch]
-    note_ids = [n["id"] for _, n in batch]
-
-    if len(batch_events) == 1:
-        text, _ = format_notification(batch_events[0])
-    else:
-        text, _ = format_batch_notification(batch_events)
-
-    images = [state.event_crops[e["id"]] for e in batch_events if e["id"] in state.event_crops]
-    sent, channel = dispatch_message(text, images=images or None)
-
-    with engine_lock:
-        for note_id in note_ids:
-            db_update_notification(note_id, message=text, dispatched=sent, channel=channel)
-
-    if sent:
-        print(f"[AI AGENT] {channel} dispatched (batch of {len(batch_events)}, {len(images)} img)")
-
-
 def notify_safety(event):
     msg, severity = format_notification(event)
 
@@ -195,7 +117,6 @@ def notify_safety(event):
         "timestamp": event["timestamp"],
         "message": msg,
         "severity": severity,
-        "stream_id": event["stream_id"],
         "dispatched": False,
         "channel": None,
     }
@@ -204,25 +125,23 @@ def notify_safety(event):
         db_insert_notification(note)
 
     if event.get("urgency", "warning") == "info":
-        return  # info: logged only, not pushed externally
+        return
 
-    global _batch_timer
-    with _batch_lock:
-        _batch_pending.append((event, note))
-        if _batch_timer is None:
-            _batch_timer = threading.Timer(BATCH_WINDOW_SECONDS, _flush_batch)
-            _batch_timer.daemon = True
-            _batch_timer.start()
+    images = [state.event_crops[event["id"]]] if event["id"] in state.event_crops else None
+    sent, channel = dispatch_message(msg, images=images)
+    with engine_lock:
+        db_update_notification(note["id"], message=msg, dispatched=sent, channel=channel)
+    if sent:
+        print(f"[AI AGENT] {channel} dispatched")
 
 
-def _log_and_dispatch_outcome(note_id, event_id, timestamp, text, severity, stream_id, log_label):
+def _log_and_dispatch_outcome(note_id, event_id, timestamp, text, severity, log_label):
     note = {
         "id": note_id,
         "event_id": event_id,
         "timestamp": timestamp,
         "message": text,
         "severity": severity,
-        "stream_id": stream_id,
         "dispatched": False,
         "channel": None,
     }
@@ -230,33 +149,22 @@ def _log_and_dispatch_outcome(note_id, event_id, timestamp, text, severity, stre
     with engine_lock:
         db_insert_notification(note)
 
-    def _send():
-        sent, channel = dispatch_message(text, purpose="action")
-        with engine_lock:
-            db_update_notification(note_id, dispatched=sent, channel=channel)
-        if sent:
-            print(f"[AI AGENT] {channel} dispatched ({log_label}): {text}")
-
-    threading.Thread(target=_send, daemon=True).start()
+    sent, channel = dispatch_message(text, purpose="action")
+    with engine_lock:
+        db_update_notification(note_id, dispatched=sent, channel=channel)
+    if sent:
+        print(f"[AI AGENT] {channel} dispatched ({log_label}): {text}")
 
 
 def notify_action_taken(event):
     _log_and_dispatch_outcome(
         f"{event['id']}-action", event["id"], event["action_at"], format_action_notification(event),
-        "resolved", event["stream_id"], "action taken",
+        "resolved", "action taken",
     )
 
 
 def notify_deleted(event):
     _log_and_dispatch_outcome(
         f"{event['id']}-deleted", event["id"], event["deleted_at"], format_delete_notification(event),
-        "deleted", event["stream_id"], "incident deleted",
-    )
-
-
-def notify_ai_confirmed(event, mention=None):
-    _log_and_dispatch_outcome(
-        f"{event['id']}-ai-confirmed", event["id"], event["verified_at"],
-        format_ai_confirmed_notification(event, mention),
-        event.get("urgency", "warning"), event["stream_id"], "AI confirmed",
+        "deleted", "incident deleted",
     )

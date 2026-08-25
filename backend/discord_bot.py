@@ -4,7 +4,6 @@ import os
 from .config import DISCORD_BOT_TOKEN, DISCORD_CHAT_CHANNEL_ID
 from .database import engine_lock, db_get_or_create_discord_session
 from .agent import run_agent_chat_session_final, resolve_pending_action
-from . import followup
 
 try:
     import discord as _discord
@@ -22,53 +21,6 @@ if _discord is not None and DISCORD_BOT_TOKEN:
     @discord_bot_client.event
     async def on_ready():
         print(f"[Discord Bot] Logged in as {discord_bot_client.user}")
-
-    async def _async_send_incident(event, text):
-        try:
-            ch = discord_bot_client.get_channel(int(DISCORD_CHAT_CHANNEL_ID))
-            if ch is None:
-                ch = await discord_bot_client.fetch_channel(int(DISCORD_CHAT_CHANNEL_ID))
-            msg = await ch.send(text)
-            await msg.add_reaction("✅")
-            await msg.add_reaction("❌")
-            followup.register_incident_message(msg.id, event["id"])
-        except Exception as e:
-            print(f"[Discord Bot] send incident error: {e}")
-
-    def _incident_sender(event, text):
-        if not DISCORD_CHAT_CHANNEL_ID:
-            return False
-        loop = discord_bot_client.loop
-        if loop is None or not loop.is_running():
-            return False
-        asyncio.run_coroutine_threadsafe(_async_send_incident(event, text), loop)
-        return True
-
-    followup.set_sender(_incident_sender)
-
-    @discord_bot_client.event
-    async def on_raw_reaction_add(payload):
-        if discord_bot_client.user and payload.user_id == discord_bot_client.user.id:
-            return
-        event_id = followup.event_for_message(payload.message_id)
-        if not event_id:
-            return
-        emoji = str(payload.emoji)
-        who = f"<@{payload.user_id}>"
-        if emoji == "✅":
-            await asyncio.to_thread(followup.mark_acted, event_id, f"Ditindak (via Discord oleh {who})")
-            ack = "✅ Insiden ditandai **sudah ditindak**."
-        elif emoji == "❌":
-            await asyncio.to_thread(followup.dismiss_with_feedback, event_id, "discord", f"Ditolak (via Discord oleh {who})")
-            ack = "🚫 Insiden **dibatalkan** — dicatat sebagai feedback koreksi AI."
-        else:
-            return
-        try:
-            ch = discord_bot_client.get_channel(payload.channel_id) or await discord_bot_client.fetch_channel(payload.channel_id)
-            msg = await ch.fetch_message(payload.message_id)
-            await msg.reply(ack, mention_author=False)
-        except Exception:
-            pass
 
     class ConfirmActionView(_discord.ui.View):
         def __init__(self, message_id, description):
@@ -108,7 +60,6 @@ if _discord is not None and DISCORD_BOT_TOKEN:
             session_id = db_get_or_create_discord_session(message.channel.id)
 
         async with message.channel.typing():
-            # while wait for agent respond
             result = await asyncio.to_thread(run_agent_chat_session_final, session_id, question)
 
         reply = (result.get("reply") or "").strip() or "Maaf, tidak ada jawaban."

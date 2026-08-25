@@ -4,16 +4,14 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..config import GEMINI_API_KEY, PERMISSION_MODES
+from ..config import GEMINI_API_KEY
 from ..database import (
     engine_lock, db_create_session, db_get_session, db_get_sessions, db_delete_session,
     db_get_messages, MAX_MESSAGES_PER_SESSION,
 )
-from .. import state
 from ..notifications import configured_channel
-from ..actions import apply_permission_mode
 from ..agent import (
-    ACTION_TOOLS, ACTION_RISK, run_agent_chat_session, run_agent_chat_session_final,
+    ACTION_TOOLS, run_agent_chat_session, run_agent_chat_session_final,
     resolve_pending_action,
 )
 
@@ -25,26 +23,7 @@ def agent_status():
     return {
         "configured": bool(GEMINI_API_KEY),
         "channel": configured_channel(),
-        "permission_mode": state.agent_permission_mode,
     }
-
-
-@router.get("/api/agent/permission-mode")
-def get_permission_mode():
-    return {
-        "mode": state.agent_permission_mode,
-        "options": list(PERMISSION_MODES),
-        "action_risk": ACTION_RISK,
-    }
-
-
-class PermissionModeSet(BaseModel):
-    mode: str
-
-
-@router.post("/api/agent/permission-mode")
-def set_permission_mode(req: PermissionModeSet):
-    return apply_permission_mode(req.mode)
 
 
 @router.get("/api/agent/sessions")

@@ -25,8 +25,8 @@ def download_report(filename: str):
 
 
 @router.get("/api/reports/generate")
-def generate(format: str = "pdf", since_hours: float = 24, zone: str = ""):
-    res = generate_report_file(format, since_hours, zone)
+def generate(format: str = "pdf"):
+    res = generate_report_file(format)
     if res.get("status") != "success":
         return res
     return FileResponse(

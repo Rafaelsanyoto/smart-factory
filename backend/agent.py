@@ -1,11 +1,11 @@
 import threading
 import time
 
-from .config import GEMINI_API_KEY, GEMINI_MODEL
+from .config import GEMINI_API_KEY, GEMINI_MODEL, MODEL_LABEL
 from .database import (
     engine_lock, db_conn, _event_row_to_dict, db_get_notifications, db_update_event,
     db_insert_message, db_get_session, db_touch_session, db_get_messages,
-    db_get_message, db_update_message_pending_action, db_feedback_summary,
+    db_get_message, db_update_message_pending_action,
 )
 from . import state
 from . import actions
@@ -15,7 +15,6 @@ from .notifications import dispatch_message
 
 REPORT_URL_BASE = "http://127.0.0.1:8000/api/reports/file"
 
-# report files generated in the current chat turn, per-thread
 _turn = threading.local()
 
 
@@ -25,13 +24,9 @@ def _turn_report_files():
     return _turn.files
 
 
-def _agent_get_events(zone="", violation_class="", event_type="", since_minutes=0, status=""):
+def _agent_get_events(violation_class="", event_type="", status=""):
     query = "SELECT * FROM events WHERE 1=1"
     params = []
-    if zone:
-        z = f"%{str(zone).lower()}%"
-        query += " AND (LOWER(zone) LIKE ? OR LOWER(stream_id) LIKE ?)"
-        params += [z, z]
     if violation_class:
         query += " AND LOWER(class) LIKE ?"
         params.append(f"%{str(violation_class).lower()}%")
@@ -41,13 +36,6 @@ def _agent_get_events(zone="", violation_class="", event_type="", since_minutes=
     if status:
         query += " AND status = ?"
         params.append(str(status).upper())
-    try:
-        since_minutes = int(since_minutes or 0)
-    except (TypeError, ValueError):
-        since_minutes = 0
-    if since_minutes > 0:
-        query += " AND ts_ms >= ?"
-        params.append(time.time() * 1000 - since_minutes * 60_000)
     query += " ORDER BY ts_ms DESC LIMIT 50"
 
     with engine_lock:
@@ -62,21 +50,12 @@ def _agent_get_notifications():
     return {"count": len(result), "notifications": result}
 
 
-def _agent_get_zone_config():
-    return actions.zones_payload()
-
-
-def _agent_get_stream_status():
-    return actions.sources_payload()
+def _agent_get_class_rules():
+    return actions.class_rules_payload()
 
 
 def _agent_get_system_config():
-    return {
-        "active_model": state.active_model_id,
-        "confidence": state.active_confidence,
-        "autonomous_mode": state.autonomous_mode,
-        "permission_mode": state.agent_permission_mode,
-    }
+    return {"active_model": MODEL_LABEL, "confidence": state.active_confidence}
 
 
 def _find_event_by_seq(seq):
@@ -96,9 +75,8 @@ def _agent_verify_incident(seq, status):
     ev = _find_event_by_seq(seq)
     if not ev:
         return {"status": "error", "message": f"insiden #{seq} tidak ditemukan"}
-    # chat-initiated verify is a human decision, not tagged verified_by="agent"
     if status == "DISMISSED":
-        updated = followup.dismiss_with_feedback(ev["id"], "agent", "Ditolak via AI Agent (perintah user)")
+        updated = followup.dismiss_event(ev["id"])
     else:
         with engine_lock:
             updated = db_update_event(ev["id"], status="CONFIRMED", verified_at=time.strftime("%H:%M:%S"))
@@ -118,13 +96,8 @@ def _agent_record_action(seq, note):
     return {"status": "success", "message": f"Tindakan untuk insiden #{seq} dicatat.", "event": updated}
 
 
-def _agent_get_feedback():
-    with engine_lock:
-        return db_feedback_summary()
-
-
-def _agent_export_report(file_format="pdf", since_hours=24, zone=""):
-    res = reports.generate_report_file(file_format, since_hours, zone)
+def _agent_export_report(file_format="pdf"):
+    res = reports.generate_report_file(file_format)
     if res.get("status") == "success":
         url = f"{REPORT_URL_BASE}/{res['filename']}"
         res["download_url"] = url
@@ -132,61 +105,40 @@ def _agent_export_report(file_format="pdf", since_hours=24, zone=""):
             "filename": res["filename"], "path": res["path"],
             "download_url": url, "format": res["format"],
         })
-        res["message"] = (
-            f"Laporan {res['format'].upper()} siap ({res['total']} insiden, "
-            f"{res['period_hours']} jam terakhir). Unduh: {url}"
-        )
+        res["message"] = f"Laporan {res['format'].upper()} siap ({res['total']} insiden). Unduh: {url}"
     return res
 
 
-def _apply_zone_classes_from_updates(stream_id, updates):
+def _apply_class_rules_from_updates(updates):
     classes = {}
     for u in (updates or []):
         name = u.get("class_name")
         if not name:
             continue
         classes[name] = {k: v for k, v in u.items() if k != "class_name"}
-    return actions.apply_zone_classes(stream_id, classes)
+    return actions.apply_class_rules(classes)
 
 
-def _agent_generate_report(since_hours=24, zone=""):
-    try:
-        since_hours = float(since_hours or 24)
-    except (TypeError, ValueError):
-        since_hours = 24
-    cutoff = time.time() * 1000 - since_hours * 3_600_000
-
-    query = "SELECT * FROM events WHERE ts_ms >= ?"
-    params = [cutoff]
-    if zone:
-        z = f"%{str(zone).lower()}%"
-        query += " AND (LOWER(zone) LIKE ? OR LOWER(stream_id) LIKE ?)"
-        params += [z, z]
-    query += " ORDER BY ts_ms ASC"
-
+def _agent_generate_report():
     with engine_lock:
-        rows = db_conn.execute(query, params).fetchall()
-    events_in_range = [_event_row_to_dict(r) for r in rows]
+        rows = db_conn.execute("SELECT * FROM events ORDER BY ts_ms ASC").fetchall()
+    events_all = [_event_row_to_dict(r) for r in rows]
 
-    by_status, by_class, by_zone = {}, {}, {}
+    by_status, by_class = {}, {}
     unresolved = []
     emergency_count = 0
-
-    for e in events_in_range:
+    for e in events_all:
         by_status[e["status"]] = by_status.get(e["status"], 0) + 1
         by_class[e["class"]] = by_class.get(e["class"], 0) + 1
-        by_zone[e["zone"]] = by_zone.get(e["zone"], 0) + 1
         if e["type"] == "EMERGENCY":
             emergency_count += 1
         if e["status"] == "CONFIRMED" and not e["action_taken"]:
-            unresolved.append({"seq": e["seq"], "class": e["class"], "zone": e["zone"], "timestamp": e["timestamp"]})
+            unresolved.append({"seq": e["seq"], "class": e["class"], "timestamp": e["timestamp"]})
 
     return {
-        "period_hours": since_hours,
-        "total_events": len(events_in_range),
+        "total_events": len(events_all),
         "by_status": by_status,
         "by_class": by_class,
-        "by_zone": by_zone,
         "emergency_count": emergency_count,
         "unresolved_confirmed_incidents": unresolved,
     }
@@ -204,127 +156,77 @@ def _agent_send_alert(text):
 
 
 READ_TOOLS = {
-    "get_events": _agent_get_events,
-    "get_notifications": _agent_get_notifications,
-    "get_zone_config": _agent_get_zone_config,
-    "get_stream_status": _agent_get_stream_status,
-    "get_system_config": _agent_get_system_config,
-    "generate_report": lambda since_hours=24, zone="": _agent_generate_report(since_hours, zone),
-    "get_agent_feedback": lambda: _agent_get_feedback(),
-    "export_report": lambda file_format="pdf", since_hours=24, zone="": _agent_export_report(file_format, since_hours, zone),
+    "get_events": lambda violation_class="", event_type="", status="": _agent_get_events(violation_class, event_type, status),
+    "get_notifications": lambda: _agent_get_notifications(),
+    "get_class_rules": lambda: _agent_get_class_rules(),
+    "get_system_config": lambda: _agent_get_system_config(),
+    "generate_report": lambda: _agent_generate_report(),
+    "export_report": lambda file_format="pdf": _agent_export_report(file_format),
 }
 
 ACTION_TOOLS = {
     "send_alert_message": lambda text: _agent_send_alert(text),
-    "set_zone_classes": lambda stream_id, updates: _apply_zone_classes_from_updates(stream_id, updates),
+    "set_class_rules": lambda updates: _apply_class_rules_from_updates(updates),
     "set_confidence": lambda confidence: actions.apply_confidence(confidence),
-    "set_stream_paused": lambda stream_id, paused: actions.apply_pause(stream_id, paused),
-    "set_stream_source": lambda stream_id, source: actions.apply_source(stream_id, source),
-    "select_model": lambda model_id: actions.apply_model(model_id),
-    "set_autonomous_mode": lambda enabled: actions.apply_autonomous_mode(enabled),
-    "set_agent_permission_mode": lambda mode: actions.apply_permission_mode(mode),
     "verify_incident": lambda seq, status: _agent_verify_incident(seq, status),
     "record_action": lambda seq, note: _agent_record_action(seq, note),
 }
-
-ACTION_RISK = {
-    "send_alert_message": "low",
-    "record_action": "low",
-    "set_zone_classes": "high",
-    "set_confidence": "high",
-    "set_stream_paused": "high",
-    "set_stream_source": "high",
-    "select_model": "high",
-    "set_autonomous_mode": "high",
-    "verify_incident": "high",
-    "set_agent_permission_mode": "high",
-}
-
-
-def _action_auto_runs(tool_name):
-    if state.agent_permission_mode == "auto":
-        return True
-    if state.agent_permission_mode == "accept_low_risk":
-        return ACTION_RISK.get(tool_name, "high") == "low"
-    return False
 
 
 AGENT_FUNCTION_DECLARATIONS = [
     {
         "name": "get_events",
         "description": (
-            "Ambil daftar event pelanggaran APD / darurat yang tercatat sistem. Tiap event punya "
-            "'seq' (nomor insiden referensi, mis. #7), status siklus penuh (PENDING/CONFIRMED/"
-            "DISMISSED/DELETED), dan detail tindakan/penghapusan jika ada (action_taken, "
-            "action_note, action_at, deleted, delete_reason, deleted_at). Bisa difilter."
+            "Ambil hasil deteksi (insiden) yang tercatat dari proses deteksi yang sudah dijalankan. "
+            "Tiap insiden punya 'seq' (nomor referensi, mis. #7) dan status siklus penuh "
+            "(PENDING/CONFIRMED/DISMISSED/DELETED)."
         ),
         "parameters": {"type": "OBJECT", "properties": {
-            "zone": {"type": "STRING", "description": "Filter nama zona atau stream_id, mis. 'Welding' atau 'stream_02'. Kosongkan untuk semua."},
             "violation_class": {"type": "STRING", "description": "Filter kelas, mis. 'NO-Mask', 'Fire'. Kosongkan untuk semua."},
             "event_type": {"type": "STRING", "description": "'VIOLATION' atau 'EMERGENCY'. Kosongkan untuk semua."},
-            "since_minutes": {"type": "INTEGER", "description": "Hanya event dalam N menit terakhir. 0 = semua."},
-            "status": {"type": "STRING", "description": "'PENDING' (belum ditinjau admin), 'CONFIRMED' (sudah dikonfirmasi asli), 'DISMISSED' (dianggap salah deteksi saat review), atau 'DELETED' (dihapus admin, biasanya duplikat). Kosongkan untuk semua."},
+            "status": {"type": "STRING", "description": "'PENDING', 'CONFIRMED', 'DISMISSED', atau 'DELETED'. Kosongkan untuk semua."},
         }},
     },
-    {"name": "get_notifications", "description": "Ambil log aktivitas notifikasi yang sudah dikirim AI Agent.",
+    {"name": "get_notifications", "description": "Ambil log notifikasi yang sudah dikirim untuk hasil deteksi.",
      "parameters": {"type": "OBJECT", "properties": {}}},
-    {"name": "get_zone_config", "description": "Ambil konfigurasi aturan tiap zona: PPE wajib dan kelas darurat yang aktif.",
+    {"name": "get_class_rules", "description": "Ambil kelas apa saja yang dimonitor (memicu insiden) dan urgensinya.",
      "parameters": {"type": "OBJECT", "properties": {}}},
-    {"name": "get_stream_status", "description": "Ambil status tiap stream/kamera: sumber (video/webcam) dan apakah sedang di-pause.",
+    {"name": "get_system_config", "description": "Ambil konfigurasi sistem: model deteksi aktif dan confidence threshold.",
      "parameters": {"type": "OBJECT", "properties": {}}},
-    {"name": "get_system_config", "description": "Ambil konfigurasi sistem: model deteksi aktif, confidence threshold, mode otonom, permission mode.",
-     "parameters": {"type": "OBJECT", "properties": {}}},
-    {"name": "get_agent_feedback", "description": "Ambil akurasi mode otonom: berapa insiden yang di-CONFIRM AI, berapa yang ternyata keliru (dibatalkan manusia), dan daftar koreksi terbaru.",
-     "parameters": {"type": "OBJECT", "properties": {}}},
-    {
-        "name": "export_report",
-        "description": (
-            "Buat FILE laporan keselamatan yang bisa diunduh (PDF / Excel / CSV) untuk periode "
-            "tertentu. Pakai ini kalau user minta laporan dalam bentuk FILE/DOKUMEN (bukan sekadar "
-            "teks atau ringkasan). Setelah dibuat, sampaikan bahwa file siap diunduh."
-        ),
-        "parameters": {"type": "OBJECT", "properties": {
-            "file_format": {"type": "STRING", "description": "'pdf', 'xlsx' (Excel), atau 'csv'. Default 'pdf'."},
-            "since_hours": {"type": "NUMBER", "description": "Rentang jam: 24 = hari ini, 168 = seminggu. Default 24."},
-            "zone": {"type": "STRING", "description": "Filter zona/stream tertentu. Kosongkan untuk semua zona."},
-        }},
-    },
     {
         "name": "generate_report",
         "description": (
-            "Ambil statistik teragregasi insiden dalam rentang waktu tertentu — total per status, "
-            "per kelas pelanggaran, per zona, jumlah darurat, dan daftar insiden CONFIRMED yang "
-            "BELUM ditindak. Pakai ini (bukan get_events) kalau diminta membuat laporan/ringkasan, "
-            "lalu susun jadi narasi yang jelas berdasarkan angka-angka ini — jangan mengarang."
+            "Ambil statistik teragregasi dari seluruh hasil proses deteksi yang tercatat sejauh ini — "
+            "total per status, per kelas pelanggaran, jumlah darurat, dan insiden CONFIRMED yang belum "
+            "ditindak. Pakai ini (bukan get_events) untuk membuat ringkasan/laporan naratif."
         ),
+        "parameters": {"type": "OBJECT", "properties": {}},
+    },
+    {
+        "name": "export_report",
+        "description": "Buat FILE laporan (PDF/Excel/CSV) berisi seluruh hasil deteksi yang tercatat, siap diunduh.",
         "parameters": {"type": "OBJECT", "properties": {
-            "since_hours": {"type": "NUMBER", "description": "Rentang waktu dalam jam, mis. 24 untuk 'hari ini', 168 untuk 'minggu ini'. Default 24."},
-            "zone": {"type": "STRING", "description": "Filter ke satu zona/stream tertentu. Kosongkan untuk semua zona."},
+            "file_format": {"type": "STRING", "description": "'pdf', 'xlsx' (Excel), atau 'csv'. Default 'pdf'."},
         }},
     },
     {
         "name": "send_alert_message",
-        "description": "Kirim pesan/laporan ke channel safety Discord. Susun teksnya sendiri berdasarkan data.",
+        "description": "Kirim pesan ke channel safety Discord. Susun teksnya sendiri berdasarkan data.",
         "parameters": {"type": "OBJECT", "properties": {
             "text": {"type": "STRING", "description": "Isi pesan yang akan dikirim."},
         }, "required": ["text"]},
     },
     {
-        "name": "set_zone_classes",
-        "description": (
-            "Atur kelas mana yang dimonitor (memicu insiden), urgensinya, dan apakah ditampilkan "
-            "di layar, untuk sebuah zona. Contoh: jadikan zona restricted dengan memonitor 'Person' "
-            "urgensi critical. stream_01=Assembly Line A, stream_02=Welding Bay B."
-        ),
+        "name": "set_class_rules",
+        "description": "Atur kelas mana yang dimonitor (memicu insiden), urgensinya, dan apakah ditampilkan di gambar hasil.",
         "parameters": {"type": "OBJECT", "properties": {
-            "stream_id": {"type": "STRING", "description": "'stream_01' atau 'stream_02'."},
             "updates": {"type": "ARRAY", "description": "Daftar perubahan per kelas.", "items": {"type": "OBJECT", "properties": {
                 "class_name": {"type": "STRING", "description": "Salah satu: NO-Hardhat, NO-Mask, NO-Safety Vest, Fire, Smoke, Person, Hardhat, Mask, Safety Vest, Safety Cone, machinery, vehicle."},
                 "monitor": {"type": "BOOLEAN", "description": "true = jadikan pemicu insiden, false = tidak."},
                 "urgency": {"type": "STRING", "description": "'info', 'warning', atau 'critical'."},
-                "display": {"type": "BOOLEAN", "description": "true = tampilkan box di video, false = sembunyikan."},
+                "display": {"type": "BOOLEAN", "description": "true = tampilkan box di gambar hasil, false = sembunyikan."},
             }, "required": ["class_name"]}},
-        }, "required": ["stream_id", "updates"]},
+        }, "required": ["updates"]},
     },
     {
         "name": "set_confidence",
@@ -332,40 +234,6 @@ AGENT_FUNCTION_DECLARATIONS = [
         "parameters": {"type": "OBJECT", "properties": {
             "confidence": {"type": "NUMBER", "description": "Nilai 0.1 sampai 0.95, mis. 0.7 untuk 70%."},
         }, "required": ["confidence"]},
-    },
-    {
-        "name": "set_stream_paused",
-        "description": "Pause atau resume (nyalakan/matikan pemrosesan) sebuah stream/kamera.",
-        "parameters": {"type": "OBJECT", "properties": {
-            "stream_id": {"type": "STRING", "description": "'stream_01' atau 'stream_02'."},
-            "paused": {"type": "BOOLEAN", "description": "true = pause/matikan, false = resume/nyalakan."},
-        }, "required": ["stream_id", "paused"]},
-    },
-    {
-        "name": "set_stream_source",
-        "description": "Ganti sumber input sebuah stream ke webcam atau file video yang tersedia.",
-        "parameters": {"type": "OBJECT", "properties": {
-            "stream_id": {"type": "STRING", "description": "'stream_01' atau 'stream_02'."},
-            "source": {"type": "STRING", "description": "'Webcam' atau nama file video (mis. 'WIN_20260821_01_16_00_Pro.mp4'). Cek get_stream_status untuk daftar opsi."},
-        }, "required": ["stream_id", "source"]},
-    },
-    {
-        "name": "select_model",
-        "description": "Ganti model deteksi YOLO.",
-        "parameters": {"type": "OBJECT", "properties": {
-            "model_id": {"type": "STRING", "description": "'yolov11m' atau 'yolo26m'."},
-        }, "required": ["model_id"]},
-    },
-    {
-        "name": "set_autonomous_mode",
-        "description": (
-            "Nyalakan/matikan mode penanganan insiden otonom. Saat ON, AI memverifikasi setiap "
-            "deteksi baru secara visual lalu meng-CONFIRM & eskalasi otomatis (tidak pernah "
-            "auto-dismiss; yang ragu diserahkan ke manusia)."
-        ),
-        "parameters": {"type": "OBJECT", "properties": {
-            "enabled": {"type": "BOOLEAN", "description": "true = nyalakan mode otonom, false = matikan."},
-        }, "required": ["enabled"]},
     },
     {
         "name": "verify_incident",
@@ -383,57 +251,39 @@ AGENT_FUNCTION_DECLARATIONS = [
             "note": {"type": "STRING", "description": "Deskripsi tindakan yang dilakukan."},
         }, "required": ["seq", "note"]},
     },
-    {
-        "name": "set_agent_permission_mode",
-        "description": (
-            "Ubah mode izin agent ini sendiri: seberapa otonom aksi-aksi (bukan tools baca) boleh "
-            "berjalan tanpa klik konfirmasi manusia."
-        ),
-        "parameters": {"type": "OBJECT", "properties": {
-            "mode": {"type": "STRING", "description": (
-                "'standard' = semua aksi selalu minta konfirmasi (default paling aman). "
-                "'accept_low_risk' = aksi aman (kirim pesan, toggle tampilan) langsung jalan, "
-                "aksi yang mempengaruhi deteksi (aturan zona, confidence, pause, ganti model) "
-                "tetap minta konfirmasi. 'auto' = semua aksi langsung jalan tanpa konfirmasi."
-            )},
-        }, "required": ["mode"]},
-    },
 ]
 
 AGENT_SYSTEM_PROMPT = (
     "Kamu adalah AI Agent asisten keselamatan kerja (HSE) untuk dashboard Smart Factory. "
     "Jawab dalam Bahasa Indonesia, ringkas dan profesional. "
-    "Selalu gunakan tools untuk mengambil data nyata sebelum menjawab pertanyaan tentang kondisi/insiden — "
+    "Sistem ini bekerja satu alur sinkron: pengguna mengunggah satu gambar/video, sistem menjalankan "
+    "satu inferensi, lalu insiden PENDING dicatat kalau ada pelanggaran — bukan pemantauan kamera "
+    "berkelanjutan. Kalau ditanya soal 'hasil deteksi', maksudnya insiden yang sudah tercatat dari "
+    "proses-proses yang sudah dijalankan, gunakan get_events / generate_report untuk data nyata, "
     "jangan mengarang angka. "
     "Untuk permintaan yang mengubah sistem atau mengirim pesan, panggil function aksi yang sesuai satu kali; "
-    "sistem akan meminta konfirmasi manusia sebelum benar-benar menjalankannya, jadi kamu tidak perlu meminta izin lagi. "
-    "Konteks: stream_01 = Assembly Line A, stream_02 = Welding Bay B. "
+    "sistem SELALU meminta konfirmasi manusia sebelum benar-benar menjalankannya, jadi kamu tidak perlu meminta izin lagi. "
     "Kelas pelanggaran APD: NO-Hardhat, NO-Mask, NO-Safety Vest. Kelas darurat: Fire, Smoke. "
-    "Setiap insiden punya nomor referensi 'seq' (mis. #7) yang tetap sama sepanjang siklus "
-    "hidupnya — selalu sebutkan nomor ini saat membahas insiden tertentu, jangan pakai UUID panjang. "
-    "Siklus status penuh: PENDING (baru terdeteksi, belum ditinjau admin) -> CONFIRMED (admin "
-    "memastikan ini pelanggaran asli) atau DISMISSED (admin menandai ini salah deteksi) -> jika "
-    "CONFIRMED, admin bisa mencatat tindakan (action_taken=true, action_note berisi tindakan yang "
-    "diambil, action_at waktunya) ATAU menghapusnya sebagai duplikat (status jadi DELETED, "
-    "delete_reason berisi alasan, deleted_at waktunya) — satu insiden selalu berakhir dengan tepat "
-    "satu hasil akhir: tindakan nyata ATAU dihapus sebagai duplikat, tidak keduanya. Kalau ditanya "
-    "status suatu insiden atau tindakan apa yang diambil, gunakan get_events dan baca field "
-    "status/action_taken/action_note/action_at/deleted/delete_reason — jangan mengarang. "
+    "Setiap insiden punya nomor referensi 'seq' (mis. #7) yang tetap sama sepanjang siklus hidupnya — "
+    "selalu sebutkan nomor ini saat membahas insiden tertentu, jangan pakai UUID panjang. "
+    "Siklus status penuh: PENDING (baru terdeteksi, belum ditinjau admin — SELALU perlu review manusia, "
+    "sistem tidak pernah meng-konfirmasi sendiri) -> CONFIRMED (admin memastikan ini pelanggaran asli) "
+    "atau DISMISSED (admin menandai ini salah deteksi) -> jika CONFIRMED, admin bisa mencatat tindakan "
+    "(action_taken=true, action_note berisi tindakan yang diambil, action_at waktunya) ATAU menghapusnya "
+    "sebagai duplikat (status jadi DELETED). Kalau ditanya status suatu insiden, gunakan get_events dan "
+    "baca field status/action_taken/action_note/action_at — jangan mengarang. "
     "Kamu BOLEH mengubah status insiden atas perintah user: pakai verify_incident untuk "
-    "CONFIRMED/DISMISSED, dan record_action untuk mencatat tindakan. Kalau user bilang sebuah "
-    "insiden sudah ditindak dengan alasan tertentu, panggil verify_incident(CONFIRMED) lalu "
-    "record_action dengan alasan itu — dalam urutan tersebut. "
-    "Kalau diminta membuat laporan/ringkasan/rekap keselamatan untuk suatu periode (hari ini, "
-    "minggu ini, dst), pakai generate_report (bukan get_events) lalu susun jadi laporan naratif "
-    "yang jelas: total insiden, tren per kelas/zona, jumlah darurat, dan soroti insiden CONFIRMED "
-    "yang belum ditindak sebagai perhatian utama."
+    "CONFIRMED/DISMISSED, dan record_action untuk mencatat tindakan. "
+    "Kalau diminta ringkasan/laporan keselamatan, pakai generate_report (bukan get_events) lalu susun "
+    "jadi laporan naratif yang jelas: total insiden, tren per kelas, jumlah darurat, dan soroti insiden "
+    "CONFIRMED yang belum ditindak sebagai perhatian utama."
 )
 
 
 def describe_action(name, args):
     if name == "send_alert_message":
         return f'Kirim pesan ke channel safety:\n"{args.get("text", "")}"'
-    if name == "set_zone_classes":
+    if name == "set_class_rules":
         parts = []
         for u in (args.get("updates") or []):
             cls = u.get("class_name", "?")
@@ -445,48 +295,32 @@ def describe_action(name, args):
             if "display" in u:
                 bits.append("tampil" if u["display"] else "sembunyi")
             parts.append(f"{cls} ({', '.join(bits)})" if bits else cls)
-        return f"Ubah kelas zona {args.get('stream_id')}: " + (", ".join(parts) if parts else "(tidak ada perubahan)")
+        return "Ubah aturan kelas: " + (", ".join(parts) if parts else "(tidak ada perubahan)")
     if name == "set_confidence":
         try:
             pct = round(float(args.get("confidence", 0)) * 100)
         except (TypeError, ValueError):
             pct = args.get("confidence")
         return f"Ubah confidence threshold ke {pct}%"
-    if name == "set_stream_paused":
-        return f"{'Pause' if args.get('paused') else 'Resume'} stream {args.get('stream_id')}"
-    if name == "set_stream_source":
-        return f"Ganti sumber stream {args.get('stream_id')} ke '{args.get('source')}'"
-    if name == "select_model":
-        return f"Ganti model deteksi ke {args.get('model_id')}"
-    if name == "set_autonomous_mode":
-        return f"{'Nyalakan' if args.get('enabled') else 'Matikan'} mode penanganan insiden otonom"
     if name == "verify_incident":
         return f"Tandai insiden #{args.get('seq')} sebagai {args.get('status')}"
     if name == "record_action":
         return f"Catat tindakan untuk insiden #{args.get('seq')}: \"{args.get('note', '')}\""
-    if name == "set_agent_permission_mode":
-        labels = {"standard": "Standard (selalu konfirmasi)", "accept_low_risk": "Accept Low-Risk (aksi aman otomatis)", "auto": "Full Auto (semua otomatis)"}
-        return f"Ubah mode izin AI Agent ke: {labels.get(args.get('mode'), args.get('mode'))}"
     return name
 
 
 def _summarize_tool_result(name, result):
     try:
         if name == "get_events":
-            return f"{result['count']} event ditemukan"
+            return f"{result['count']} insiden ditemukan"
         if name == "get_notifications":
             return f"{result['count']} notifikasi ditemukan"
-        if name == "get_zone_config":
-            return f"{len(result['zones'])} zona dimuat"
-        if name == "get_stream_status":
-            return f"status {len(result.get('current', {}))} stream dimuat"
+        if name == "get_class_rules":
+            return f"{len(result['classes'])} kelas dimuat"
         if name == "get_system_config":
             return f"model aktif: {result.get('active_model')}, confidence: {result.get('confidence')}"
         if name == "generate_report":
-            return f"{result['total_events']} insiden dalam {result['period_hours']} jam terakhir, {len(result['unresolved_confirmed_incidents'])} belum ditindak"
-        if name == "get_agent_feedback":
-            acc = result.get("accuracy")
-            return f"akurasi otonom: {round(acc*100)}% ({result.get('mistakes')} koreksi)" if acc is not None else "belum ada data otonom"
+            return f"{result['total_events']} insiden tercatat, {len(result['unresolved_confirmed_incidents'])} belum ditindak"
         if name == "export_report":
             if result.get("status") == "success":
                 return f"file {result['format'].upper()} dibuat ({result.get('total')} insiden)"
@@ -497,13 +331,11 @@ def _summarize_tool_result(name, result):
 
 
 TOOL_LABELS = {
-    "get_events": "Mengambil data event pelanggaran/darurat",
+    "get_events": "Mengambil hasil deteksi",
     "get_notifications": "Mengambil log notifikasi",
-    "get_zone_config": "Mengambil konfigurasi zona",
+    "get_class_rules": "Mengambil aturan kelas",
     "generate_report": "Menyusun statistik laporan",
-    "get_stream_status": "Mengecek status stream/kamera",
     "get_system_config": "Mengecek konfigurasi sistem",
-    "get_agent_feedback": "Mengecek akurasi mode otonom",
     "export_report": "Membuat file laporan",
 }
 
@@ -546,9 +378,7 @@ def run_agent_chat_steps(history):
                 yield {"step": "final", "configured": True, "reply": (resp.text or "").strip(), "pending_action": None}
                 return
 
-            needs_confirm = next(
-                (c for c in calls if c.name in ACTION_TOOLS and not _action_auto_runs(c.name)), None,
-            )
+            needs_confirm = next((c for c in calls if c.name in ACTION_TOOLS), None)
             if needs_confirm is not None:
                 args = dict(needs_confirm.args or {})
                 yield {
@@ -568,15 +398,10 @@ def run_agent_chat_steps(history):
             parts = []
             for c in calls:
                 args = dict(c.args or {})
-                if c.name in ACTION_TOOLS:
-                    yield {"step": "action_call", "name": c.name, "label": describe_action(c.name, args), "args": args}
-                    result = ACTION_TOOLS[c.name](**args)
-                    yield {"step": "action_result", "name": c.name, "summary": result.get("message") or "Aksi dijalankan otomatis."}
-                else:
-                    yield {"step": "tool_call", "name": c.name, "label": TOOL_LABELS.get(c.name, c.name), "args": args}
-                    fn = READ_TOOLS.get(c.name)
-                    result = fn(**args) if fn else {"error": "unknown tool"}
-                    yield {"step": "tool_result", "name": c.name, "summary": _summarize_tool_result(c.name, result)}
+                yield {"step": "tool_call", "name": c.name, "label": TOOL_LABELS.get(c.name, c.name), "args": args}
+                fn = READ_TOOLS.get(c.name)
+                result = fn(**args) if fn else {"error": "unknown tool"}
+                yield {"step": "tool_result", "name": c.name, "summary": _summarize_tool_result(c.name, result)}
                 parts.append(types.Part.from_function_response(name=c.name, response={"result": result}))
             contents.append(types.Content(role="user", parts=parts))
             continue
@@ -614,7 +439,7 @@ def run_agent_chat_session(session_id, user_text):
     collected_steps = []
     final_step = None
     for step in run_agent_chat_steps(history):
-        if step["step"] in ("thinking", "tool_call", "tool_result", "action_call", "action_result"):
+        if step["step"] in ("thinking", "tool_call", "tool_result"):
             collected_steps.append(step)
         else:
             final_step = step

@@ -2,10 +2,10 @@ import csv
 import os
 import time
 
-from .config import PROJECT_ROOT
+from .config import DATA_DIR
 from .database import engine_lock, db_conn, _event_row_to_dict
 
-REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports")
+REPORTS_DIR = os.path.join(DATA_DIR, "reports")
 
 _STATUS_LABEL = {
     "PENDING": "Menunggu Review", "CONFIRMED": "Terkonfirmasi",
@@ -13,41 +13,25 @@ _STATUS_LABEL = {
 }
 
 
-def _gather(since_hours, zone):
-    try:
-        since_hours = float(since_hours or 24)
-    except (TypeError, ValueError):
-        since_hours = 24
-    cutoff = time.time() * 1000 - since_hours * 3_600_000
-    query = "SELECT * FROM events WHERE ts_ms >= ?"
-    params = [cutoff]
-    if zone:
-        z = f"%{str(zone).lower()}%"
-        query += " AND (LOWER(zone) LIKE ? OR LOWER(stream_id) LIKE ?)"
-        params += [z, z]
-    query += " ORDER BY ts_ms DESC"
+def _gather():
     with engine_lock:
-        rows = db_conn.execute(query, params).fetchall()
+        rows = db_conn.execute("SELECT * FROM events ORDER BY ts_ms DESC").fetchall()
     events = [_event_row_to_dict(r) for r in rows]
 
-    by_status, by_class, by_zone = {}, {}, {}
+    by_status, by_class = {}, {}
     emergency = 0
     unresolved = 0
     for e in events:
         by_status[e["status"]] = by_status.get(e["status"], 0) + 1
         by_class[e["class"]] = by_class.get(e["class"], 0) + 1
-        by_zone[e["zone"]] = by_zone.get(e["zone"], 0) + 1
         if e["type"] == "EMERGENCY":
             emergency += 1
         if e["status"] == "CONFIRMED" and not e["action_taken"]:
             unresolved += 1
     summary = {
-        "period_hours": since_hours,
-        "zone_filter": zone or "Semua zona",
         "total": len(events),
         "by_status": by_status,
         "by_class": by_class,
-        "by_zone": by_zone,
         "emergency": emergency,
         "unresolved": unresolved,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -55,13 +39,12 @@ def _gather(since_hours, zone):
     return events, summary
 
 
-_COLUMNS = ["seq", "timestamp", "zone", "class", "type", "urgency", "status", "action_note"]
-_HEADERS = ["#", "Waktu", "Zona", "Kelas", "Jenis", "Urgensi", "Status", "Tindakan"]
+_HEADERS = ["#", "Waktu", "Kelas", "Jenis", "Urgensi", "Status", "Tindakan"]
 
 
 def _row(e):
     return [
-        e.get("seq"), e.get("timestamp"), e.get("zone"), e.get("class"), e.get("type"),
+        e.get("seq"), e.get("timestamp"), e.get("class"), e.get("type"),
         (e.get("urgency") or "-"), _STATUS_LABEL.get(e.get("status"), e.get("status")),
         e.get("action_note") or ("[dihapus] " + (e.get("delete_reason") or "") if e.get("deleted") else "-"),
     ]
@@ -72,8 +55,6 @@ def _to_csv(path, events, summary):
         w = csv.writer(f)
         w.writerow(["Laporan Keselamatan HSE — Smart Factory"])
         w.writerow(["Dibuat", summary["generated_at"]])
-        w.writerow(["Periode (jam)", summary["period_hours"]])
-        w.writerow(["Zona", summary["zone_filter"]])
         w.writerow(["Total insiden", summary["total"]])
         w.writerow(["Darurat", summary["emergency"]])
         w.writerow(["Terkonfirmasi belum ditindak", summary["unresolved"]])
@@ -97,8 +78,6 @@ def _to_xlsx(path, events, summary):
     ws["A1"].font = Font(bold=True, size=14)
     meta = [
         ("Dibuat", summary["generated_at"]),
-        ("Periode (jam)", summary["period_hours"]),
-        ("Zona", summary["zone_filter"]),
         ("Total insiden", summary["total"]),
         ("Darurat", summary["emergency"]),
         ("Terkonfirmasi belum ditindak", summary["unresolved"]),
@@ -113,11 +92,6 @@ def _to_xlsx(path, events, summary):
     r += 1
     for k, v in summary["by_status"].items():
         ws.cell(r, 1, _STATUS_LABEL.get(k, k)); ws.cell(r, 2, v); r += 1
-    r += 1
-    ws.cell(r, 1, "Per Zona").font = Font(bold=True)
-    r += 1
-    for k, v in summary["by_zone"].items():
-        ws.cell(r, 1, k); ws.cell(r, 2, v); r += 1
     ws.column_dimensions["A"].width = 32
     ws.column_dimensions["B"].width = 22
 
@@ -130,7 +104,7 @@ def _to_xlsx(path, events, summary):
         cell.alignment = Alignment(horizontal="center")
     for e in events:
         ws2.append(_row(e))
-    widths = [6, 12, 26, 16, 12, 10, 18, 40]
+    widths = [6, 12, 16, 12, 10, 18, 40]
     for i, wd in enumerate(widths, 1):
         ws2.column_dimensions[chr(64 + i)].width = wd
     ws2.freeze_panes = "A2"
@@ -149,10 +123,7 @@ def _to_pdf(path, events, summary):
     doc = SimpleDocTemplate(path, pagesize=landscape(A4), topMargin=15 * mm, bottomMargin=15 * mm)
     story = [
         Paragraph("Laporan Keselamatan HSE — Smart Factory", title_style),
-        Paragraph(
-            f"Dibuat {summary['generated_at']} · Periode {summary['period_hours']} jam · "
-            f"Zona: {summary['zone_filter']}", styles["Normal"],
-        ),
+        Paragraph(f"Dibuat {summary['generated_at']}", styles["Normal"]),
         Spacer(1, 8),
     ]
     summ = [
@@ -173,7 +144,7 @@ def _to_pdf(path, events, summary):
     story += [st, Spacer(1, 12), Paragraph("Daftar Insiden", styles["Heading3"])]
 
     data = [_HEADERS] + [[str(x) if x is not None else "" for x in _row(e)] for e in events[:400]]
-    tbl = Table(data, repeatRows=1, colWidths=[14, 55, 120, 75, 60, 50, 80, 160])
+    tbl = Table(data, repeatRows=1, colWidths=[14, 55, 75, 60, 50, 80, 160])
     tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E3A5F")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -188,14 +159,14 @@ def _to_pdf(path, events, summary):
     doc.build(story)
 
 
-def generate_report_file(fmt="pdf", since_hours=24, zone=""):
+def generate_report_file(fmt="pdf"):
     fmt = str(fmt).lower().strip()
     if fmt in ("excel", "xls"):
         fmt = "xlsx"
     if fmt not in ("pdf", "xlsx", "csv"):
         return {"status": "error", "message": f"Format '{fmt}' tidak didukung. Pilih pdf, xlsx, atau csv."}
 
-    events, summary = _gather(since_hours, zone)
+    events, summary = _gather()
     os.makedirs(REPORTS_DIR, exist_ok=True)
     filename = f"laporan_hse_{time.strftime('%Y%m%d_%H%M%S')}.{fmt}"
     path = os.path.join(REPORTS_DIR, filename)
@@ -215,5 +186,4 @@ def generate_report_file(fmt="pdf", since_hours=24, zone=""):
         "path": path,
         "format": fmt,
         "total": summary["total"],
-        "period_hours": summary["period_hours"],
     }

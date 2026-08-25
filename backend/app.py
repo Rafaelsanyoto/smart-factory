@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import streams, settings, events, agent, reports
+from .routers import detect, settings, events, agent, reports
 from . import discord_bot
 
 app = FastAPI(title="Smart Factory HSE API")
@@ -13,7 +13,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(streams.router)
+app.include_router(detect.router)
 app.include_router(settings.router)
 app.include_router(events.router)
 app.include_router(agent.router)

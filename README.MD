@@ -1,24 +1,25 @@
-# SafeSight AI — Smart Factory HSE Command Dashboard
+# SafeSight AI — Smart Factory HSE Command Dashboard (MVP)
 
-Autonomous Safety Surveillance & Incident Workflow system for AI Innovation Challenge (AIC) COMPFEST 18, Smart Manufacturing track — real-time YOLO-based PPE compliance & fire/smoke detection, a server-side rule engine with full incident lifecycle tracking, an AI Agent (Gemini function calling), and a FastAPI + React dashboard.
+AI Innovation Challenge (AIC) COMPFEST 18, Smart Manufacturing track. MVP submission scope:
+upload one image/video, run one YOLO detection pass, review the result — every incident
+always waits for a human to confirm it.
 
 ---
 
 ## Tech Stack
 
 **Backend** — `backend/` package (run via `api.py`)
-- [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) — HTTP API & MJPEG video streaming
-- [Ultralytics YOLO](https://docs.ultralytics.com/) (YOLOv11m / YOLO26m) + [OpenCV](https://opencv.org/) — object detection & video capture
-- [google-genai](https://pypi.org/project/google-genai/) (Gemini) — AI Agent chat with function calling (tool use)
+- [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) — HTTP API
+- [Ultralytics YOLO](https://docs.ultralytics.com/) (YOLO26m, single model) + [OpenCV](https://opencv.org/) — object detection
+- [google-genai](https://pypi.org/project/google-genai/) (Gemini) — AI Agent chat with function calling
 - [discord.py](https://pypi.org/project/discord.py/) — two-way Discord chat bot (optional)
-- Plain `urllib` — Discord webhook dispatch (no extra HTTP client dependency)
-- [SQLite](https://www.sqlite.org/) (`smart_factory.db`, stdlib `sqlite3`) — persists the full incident lifecycle, notifications, zone rules, system config, and AI Agent chat history across restarts.
+- Plain `urllib` — Discord webhook dispatch
+- [SQLite](https://www.sqlite.org/) (`data/smart_factory.db`) — incidents, notifications, class rules, chat history
 
 **Frontend** — `frontend/` (Vite + React)
-- [React](https://react.dev/) + [React Router](https://reactrouter.com/) — SPA with client-side routing
-- [Tailwind CSS](https://tailwindcss.com/) — styling
-- [Recharts](https://recharts.org/) — Analytics charts
-- [lucide-react](https://lucide.dev/) — icons (the only icon set used, by design)
+- [React](https://react.dev/) + [React Router](https://reactrouter.com/)
+- [Tailwind CSS](https://tailwindcss.com/)
+- [lucide-react](https://lucide.dev/) — the only icon set used
 
 ---
 
@@ -26,96 +27,96 @@ Autonomous Safety Surveillance & Incident Workflow system for AI Innovation Chal
 
 ```
 smart-factory/
-├── api.py                      # Entry point — thin launcher: `from backend.app import app` + uvicorn
-├── backend/                    # Backend package (split by responsibility)
-│   ├── app.py                  #   Assembles FastAPI: CORS, routers, Discord startup hook
-│   ├── config.py               #   Paths, .env, model registry, PPE/zone constants
-│   ├── database.py             #   SQLite layer — all db_* helpers, schema init/seed
-│   ├── state.py                #   Runtime-mutable state (active model/confidence, zone rules, ...)
-│   ├── notifications.py        #   Notification templates, Discord dispatch, batching
-│   ├── rule_engine.py          #   Episode model + IoU matching → structured incidents
-│   ├── camera.py               #   SmoothCameraManager (capture/ai/render threads), MJPEG stream
-│   ├── actions.py              #   apply_* helpers shared by REST routes AND the AI Agent
-│   ├── agent.py                #   AI Agent: tools, Gemini function-calling loop, chat sessions
-│   ├── discord_bot.py          #   Two-way Discord chat bot (optional)
-│   └── routers/                #   FastAPI routers grouped by domain
-│       ├── streams.py          #     video, data, source/pause
-│       ├── settings.py         #     health, db-info, model/confidence, zones, context classes
-│       ├── events.py           #     incident lifecycle (verify/action/delete), notifications
-│       └── agent.py            #     all /api/agent/* endpoints
+├── api.py                      # Entry point — `from backend.app import app` + uvicorn
+├── backend/
+│   ├── app.py                  # Assembles FastAPI: CORS, routers, Discord startup hook
+│   ├── config.py                # Paths, .env, single model path, class taxonomy
+│   ├── database.py              # SQLite layer
+│   ├── state.py                 # Runtime-mutable state (confidence, class rules)
+│   ├── detect.py                 # Single-shot inference: one upload -> one result
+│   ├── rule_engine.py            # Monitored-class check -> PENDING incident
+│   ├── notifications.py          # Notification templates + Discord dispatch
+│   ├── followup.py               # mark_acted / dismiss_event
+│   ├── actions.py                # apply_* helpers shared by REST routes AND the AI Agent
+│   ├── agent.py                   # AI Agent: tools, Gemini function-calling loop, chat sessions
+│   ├── reports.py                 # PDF/XLSX/CSV report generation
+│   ├── discord_bot.py             # Two-way Discord chat bot (optional)
+│   └── routers/
+│       ├── detect.py               # POST /api/detect
+│       ├── settings.py             # health, db-info, model info, confidence, class rules
+│       ├── events.py               # incident lifecycle (verify/action/delete/acknowledge)
+│       ├── agent.py                # /api/agent/* endpoints
+│       └── reports.py              # report file endpoints
 │
-├── smart_factory.db            # SQLite database (gitignored — created on first run)
-├── .env                        # Your local secrets (gitignored) — copy from .env.example
-├── .env.example                # Template: Gemini key, Discord channel + bot setup instructions
+├── data/                        # SQLite DB + generated reports (gitignored, created on first run)
+├── .env / .env.example          # Secrets: Gemini key, Discord webhook/bot
 │
-├── model dan dataset/          # YOLO weights + training dataset (gitignored — only folder tracked)
-│   ├── yolo v11.pt
-│   ├── yolo v26.pt
-│   └── master_dataset/         # train/valid/test images + labels, data.yaml
+├── model dan dataset/            # YOLO26m weights (gitignored — only folder tracked)
+│   └── yolo v26.pt
 │
-├── VIdeo Testing/               # Dummy CCTV footage for the two demo streams (gitignored)
-├── Gambar testing/               # Test images (gitignored)
+├── Dockerfile.backend
+├── docker-compose.yml
 │
 └── frontend/
-    ├── src/
-    │   ├── App.jsx              # Shell: nav, header status, lifted incident polling
-    │   ├── pages/
-    │   │   ├── Login.jsx         # admin/admin gate
-    │   │   ├── LiveMonitor.jsx   # Video feed, live breakdown, incident queue, action tracking
-    │   │   ├── Analytics.jsx     # Charts over confirmed incidents
-    │   │   ├── Settings.jsx      # Model/confidence/zone rules/source/pause/display filters
-    │   │   └── AgentChat.jsx     # AI Agent chat page (streaming tool-call trail)
-    │   ├── main.jsx / index.css
-    │   └── assets/
-    ├── package.json
-    └── vite.config.js
+    ├── Dockerfile / nginx.conf
+    └── src/
+        ├── App.jsx                # Shell: nav, header status, lifted incident polling
+        ├── pages/
+        │   ├── Login.jsx            # admin/admin gate
+        │   ├── Detect.jsx           # upload -> Mulai Proses -> result + incident review
+        │   ├── Settings.jsx         # confidence, class rules, db info
+        │   └── AgentChat.jsx        # AI Agent chat page
+        └── components/
 ```
 
 ---
 
 ## Features
 
-### Detection pipeline
-- Two simulated CCTV streams (dummy video, or switch either to your **webcam** live from Settings)
-- 12-class YOLO model: PPE compliance (Hardhat, Mask, Safety Vest + their `NO-*` violation counterparts), Fire, Smoke, and context objects (Person, Safety Cone, machinery, vehicle)
-- Runtime **model switching** (YOLOv11m ↔ YOLO26m) and **confidence threshold** tuning, no restart needed
-- Per-stream **pause/resume** — streams start **paused by default**; nothing is captured or detected until resumed
-- Configurable per-zone rules: which PPE is required, which emergency classes (Fire/Smoke) are monitored
+### Detection — single synchronous flow
+Upload one image or video, click **Mulai Proses**. The backend runs YOLO26m once (for a
+video, on frames sampled evenly across it), draws the results, and returns one annotated
+image plus the detection list — all within that one request. There is no background
+capture loop and no continuous camera stream.
 
-### Server-side rule engine
-- Detections don't create incidents immediately — an episode must be seen continuously for **5 seconds** (filters single-frame flicker) before it's confirmed real
-- Episodes are matched by **spatial position (IoU)**, not tracker ID (YOLO's tracker reassigns IDs too often to be a reliable person identity) — so two people violating at once, in different spots, are correctly tracked as separate incidents
-- A **30-second continuity window**: the same ongoing violation doesn't re-fire repeatedly; a genuinely new occurrence (after the class has been absent from that zone for 30s+) starts a fresh episode
+### Rule check -> incident
+Every detected object belonging to a monitored class (configurable in Settings) creates
+one `PENDING` incident, recorded synchronously in that same request.
 
-### Full incident lifecycle tracking
-`PENDING` (detected) → `CONFIRMED` / `DISMISSED` (admin review in Live Monitor) → **action recorded** (admin logs what remediation was taken). Every stage is backend-persisted and queryable — nothing lives only in the browser.
+### Incident lifecycle — always human-reviewed
+`PENDING` (detected) → `CONFIRMED` / `DISMISSED` (human review) → **action recorded**.
+Nothing auto-confirms: there is no autonomous vision verification and no reminder
+scheduler — review happens whenever an operator looks at the queue.
 
 ### AI Agent (Gemini function calling)
-- Chat page with a **live step trail** (streamed NDJSON) — see exactly which tool it's calling and what it found, not just a spinner
-- **Read tools** (safe, auto-executed): query events (with status/zone/class/time filters), notifications, zone config, stream status, system config
-- **Action tools** (proposed, never auto-run): send an alert, change zone rules, change confidence, pause/resume a stream, switch model, toggle display filters — every action surfaces a confirm/cancel card first
-- Ask it things like *"Ada pelanggaran apa 10 menit terakhir?"*, *"Zona mana paling sering melanggar?"*, or *"Pause kamera Welding Bay"*
+- Chat page with a live step trail — see which tool it calls and what it found
+- **Read tools** (auto-executed): query recorded incidents/notifications, class rules,
+  system config, aggregate report stats
+- **Action tools** (always proposed, never auto-run): send an alert, change class rules,
+  change confidence, verify/dismiss an incident, record an action — every action shows a
+  confirm/cancel card first, with no auto-run mode
+- Ask it things like *"Berapa insiden Fire yang belum ditindak?"* or *"Kirim ringkasan ke Discord"*
 
 ### Notifications
-- Deterministic, consistently-formatted messages (bold + bullet points, every incident tagged `#seq`) — no LLM involved, so wording never varies
-- Auto-**batches** events that fire within a 2-second window into a single outbound message instead of spamming one per detection
-- Dispatched to **Discord** via webhook — optionally to **two separate channels**: one for new detections, another for "action taken" / deletion updates
+Deterministic, consistently-formatted messages sent to Discord via webhook as soon as an
+incident is recorded, plus updates when action is taken or an incident is deleted.
 
-### Discord bot (two-way chat)
-- Optional: ask the AI Agent questions directly from a Discord channel, no dashboard needed
-- Requires a real **Bot Token** (not a webhook — webhooks are push-only) with Message Content Intent enabled
-- Read-only by design — it answers using the same tools as the dashboard chat, but can't execute actions from Discord (there's no confirm/cancel UI there)
+### Discord bot (two-way chat, optional)
+Chat with the AI Agent from a Discord channel — same tools as the dashboard, action
+requests show a confirm/cancel button.
 
 ---
 
 ## Prerequisites
 
-- **Python 3.10+** with a CUDA-capable environment recommended (YOLO inference is much faster on GPU; CPU works but slower)
+- **Python 3.10+**
 - **Node.js 18+** & npm
+- YOLO26m weights at `model dan dataset/yolo v26.pt` (not included in this repo)
+- Docker + Docker Compose (only if running via `docker compose up`)
 
 ---
 
-## Setup
+## Setup — native
 
 ### 1. Environment variables
 
@@ -123,24 +124,23 @@ smart-factory/
 cp .env.example .env
 ```
 
-Edit `.env` and fill in what you need (all optional — the app runs fine with everything blank, just without AI Agent chat / external notifications):
+All variables are optional — the app runs without any of them, just without AI Agent
+chat / Discord notifications.
 
-| Variable | Purpose | How to get it |
-|---|---|---|
-| `GEMINI_API_KEY` | Powers the AI Agent chat | https://aistudio.google.com/apikey (free tier) |
-| `GEMINI_MODEL` | Defaults to `gemini-flash-lite-latest` — has a much higher free daily quota than full "flash" models | — |
-| `DISCORD_WEBHOOK_URL` | Notification channel for new detections | Discord → Server Settings → Integrations → Webhooks → New Webhook |
-| `DISCORD_WEBHOOK_URL_ACTIONS` | Optional 2nd channel, just for "action taken" / deletion updates | Same as above, different channel |
-| `DISCORD_BOT_TOKEN` / `DISCORD_CHAT_CHANNEL_ID` | Optional: two-way chat — ask the AI Agent from Discord directly | Discord Developer Portal → New Application → Bot tab → Reset Token (enable **Message Content Intent**), invite via OAuth2 URL Generator. Channel ID via right-click → Copy Channel ID (needs Developer Mode) |
-
-> `DISCORD_WEBHOOK_URL*` and `DISCORD_BOT_TOKEN` are different credential types — a webhook can only push messages *into* Discord, it can never read what's typed there. The bot token is what enables the two-way chat.
+| Variable | Purpose |
+|---|---|
+| `GEMINI_API_KEY` | Powers the AI Agent chat (https://aistudio.google.com/apikey) |
+| `GEMINI_MODEL` | Defaults to `gemini-flash-lite-latest` |
+| `DISCORD_WEBHOOK_URL` | Notification channel for new incidents |
+| `DISCORD_WEBHOOK_URL_ACTIONS` | Optional 2nd channel for action/deletion updates |
+| `DISCORD_BOT_TOKEN` / `DISCORD_CHAT_CHANNEL_ID` | Optional two-way Discord chat |
 
 ### 2. Backend
 
 ```bash
 python -m venv venv
 venv\Scripts\activate          # Windows
-pip install fastapi uvicorn ultralytics opencv-python numpy google-genai discord.py
+pip install -r requirements.txt
 python api.py
 ```
 
@@ -158,4 +158,18 @@ Open the printed dev URL (usually `http://localhost:5173`).
 
 **Login:** `admin` / `admin`
 
-> Streams start **paused** — click **Resume Feed** on Live Monitor (or from Settings) to start detection.
+---
+
+## Setup — Docker
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+- Backend: `http://localhost:8000`
+- Frontend: `http://localhost:5173`
+
+The YOLO weights (`model dan dataset/yolo v26.pt`) and `.env` are read from the host —
+make sure the weights file exists locally before starting. SQLite data and generated
+reports persist in `./data` on the host.

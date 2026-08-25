@@ -30,7 +30,7 @@ def verify_event(event_id: str, req: EventVerify):
         if not event:
             return {"status": "error", "message": "event tidak ditemukan"}
     if status == "DISMISSED":
-        result = followup.dismiss_with_feedback(event_id, "web", "Ditolak admin (salah deteksi)")
+        result = followup.dismiss_event(event_id)
     else:
         with engine_lock:
             result = db_update_event(event_id, status="CONFIRMED", verified_at=time.strftime("%H:%M:%S"))

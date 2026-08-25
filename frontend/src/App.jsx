@@ -1,9 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, Navigate } from 'react-router-dom';
-import { Activity, BarChart, Settings, Video, LogOut, Cpu, Wifi, WifiOff, Bot, ClipboardList } from 'lucide-react';
-import LiveMonitor from './pages/LiveMonitor';
-import Analytics from './pages/Analytics';
-import Incidents from './pages/Incidents';
+import { Activity, Settings, Video, LogOut, Cpu, Wifi, WifiOff, Bot } from 'lucide-react';
+import Detect from './pages/Detect';
 import Configuration from './pages/Settings';
 import AgentChat from './pages/AgentChat';
 import Login from './pages/Login';
@@ -43,17 +41,13 @@ export default function App() {
     type: (e.class || '').toUpperCase(),
     zone: e.zone,
     eventType: e.type, // VIOLATION | EMERGENCY
-    streamId: e.stream_id,
     confidence: e.confidence,
     status: e.status,
     actionTaken: e.action_taken,
     actionNote: e.action_note,
     actionAt: e.action_at,
-    urgency: e.urgency,           // info | warning | critical (per-zone per-class)
-    verifiedBy: e.verified_by,    // "agent" when confirmed by autonomous handling
-    agentVerdict: e.agent_verdict, // real | false | uncertain (autonomous opinion)
-    agentReasoning: e.agent_reasoning,
-    alarmAckAt: e.alarm_ack_at,   // set once an operator acknowledges the critical alarm
+    urgency: e.urgency,
+    alarmAckAt: e.alarm_ack_at, // set once an operator acknowledges the critical alarm
   });
 
   const refreshIncidents = useCallback(async () => {
@@ -81,8 +75,7 @@ export default function App() {
         const data = await res.json();
         if (cancelled) return;
         setBackendOnline(true);
-        const active = data.models?.find((m) => m.id === data.active);
-        setModelLabel(active ? active.label : data.active);
+        setModelLabel(data.label || data.active);
       } catch {
         if (cancelled) return;
         setBackendOnline(false);
@@ -125,9 +118,7 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 bg-slate-950 p-1 rounded-lg border border-slate-800">
-            <NavLink to="/" icon={Video} label="Live Monitor" />
-            <NavLink to="/incidents" icon={ClipboardList} label="Insiden" />
-            <NavLink to="/analytics" icon={BarChart} label="Analitik" />
+            <NavLink to="/" icon={Video} label="Deteksi" />
             <NavLink to="/agent" icon={Bot} label="AI Agent" />
             <NavLink to="/settings" icon={Settings} label="Pengaturan" />
           </div>
@@ -168,17 +159,12 @@ export default function App() {
             <Route
               path="/"
               element={
-                <LiveMonitor
+                <Detect
                   pendingIncidents={pendingIncidents}
                   verifiedIncidents={verifiedIncidents}
                   refreshIncidents={refreshIncidents}
                 />
               }
-            />
-            <Route path="/incidents" element={<Incidents />} />
-            <Route
-              path="/analytics"
-              element={<Analytics verifiedIncidents={verifiedIncidents} />}
             />
             <Route path="/agent" element={<AgentChat />} />
             <Route path="/settings" element={<Configuration />} />

@@ -1,0 +1,9 @@
+frontend
+data
+reports
+__pycache__
+*.pyc
+.env
+.git
+Gambar testing
+VIdeo Testing
