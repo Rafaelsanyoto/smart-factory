@@ -42,6 +42,7 @@ export default function App() {
     id: e.id,
     seq: e.seq,
     time: e.timestamp,
+    tsMs: e.ts_ms,
     type: (e.class || '').toUpperCase(),
     zone: e.zone,
     eventType: e.type, // VIOLATION | EMERGENCY
@@ -51,6 +52,10 @@ export default function App() {
     actionTaken: e.action_taken,
     actionNote: e.action_note,
     actionAt: e.action_at,
+    urgency: e.urgency,           // info | warning | critical (per-zone per-class)
+    verifiedBy: e.verified_by,    // "agent" when confirmed by autonomous handling
+    agentVerdict: e.agent_verdict, // real | false | uncertain (autonomous opinion)
+    agentReasoning: e.agent_reasoning,
   });
 
   const refreshIncidents = useCallback(async () => {

@@ -6,7 +6,8 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from ..database import engine_lock, db_get_events, db_get_event, db_update_event, db_get_notifications
-from ..notifications import notify_action_taken, notify_deleted
+from ..notifications import notify_deleted
+from .. import followup
 
 router = APIRouter()
 
@@ -33,7 +34,13 @@ def verify_event(event_id: str, req: EventVerify):
         event = db_get_event(event_id)
         if not event:
             return {"status": "error", "message": "event tidak ditemukan"}
-        result = db_update_event(event_id, status=status, verified_at=time.strftime("%H:%M:%S"))
+    # DISMISSED goes through followup so a dismissal of an agent-confirmed incident is
+    # captured as AI feedback; CONFIRMED is a straight status update.
+    if status == "DISMISSED":
+        result = followup.dismiss_with_feedback(event_id, "web", "Ditolak admin (salah deteksi)")
+    else:
+        with engine_lock:
+            result = db_update_event(event_id, status="CONFIRMED", verified_at=time.strftime("%H:%M:%S"))
     return {"status": "success", "event": result}
 
 
@@ -55,11 +62,7 @@ def record_action(event_id: str, req: EventAction):
             return {"status": "error", "message": "event tidak ditemukan"}
         if event["status"] != "CONFIRMED":
             return {"status": "error", "message": "hanya insiden berstatus CONFIRMED yang bisa dicatat tindakannya"}
-        result = db_update_event(
-            event_id, action_taken=True, action_note=note_text, action_at=time.strftime("%H:%M:%S"),
-        )
-
-    notify_action_taken(result)
+    result = followup.mark_acted(event_id, note_text)  # shared with Discord ✅ + agent tool
     return {"status": "success", "event": result}
 
 

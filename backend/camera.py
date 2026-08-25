@@ -9,9 +9,30 @@ import cv2
 from fastapi import Request
 from ultralytics import YOLO
 
-from .config import MODEL_REGISTRY, DEFAULT_MODEL, CONTEXT_CLASSES, EMERGENCY_CLASSES, STREAM_SOURCES
+from .config import MODEL_REGISTRY, DEFAULT_MODEL, EMERGENCY_CLASSES, STREAM_SOURCES
 from . import state
 from .rule_engine import process_rules
+from .notifications import notify_safety
+from . import autonomous
+
+
+def _evidence_jpeg(frame, box):
+    """Full-frame JPEG with the triggering detection boxed + labeled. A full scene with a
+    highlight box is clearer evidence than a tight crop (you see where/what in context), and
+    gives the autonomous vision model more context while still pointing it at the region.
+    Returns bytes, or None on failure."""
+    img = frame.copy()
+    x1, y1, x2, y2 = (int(v) for v in (box.get("xyxy") or [0, 0, 0, 0]))
+    cls = box.get("class_name", "")
+    color = (0, 128, 255) if cls in EMERGENCY_CLASSES else (0, 0, 255)  # BGR: orange / red
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
+    label = f"{cls} {box.get('confidence', '')}".strip()
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    ly = y1 - 8 if y1 - 8 > th else y1 + th + 8
+    cv2.rectangle(img, (x1, ly - th - 6), (x1 + tw + 6, ly + 4), color, -1)
+    cv2.putText(img, label, (x1 + 3, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return buf.tobytes() if ok else None
 
 
 class SmoothCameraManager:
@@ -120,7 +141,17 @@ class SmoothCameraManager:
                 })
 
             self.latest_boxes = boxes_data
-            process_rules(self.stream_id, boxes_data)  # tags violation/emergency boxes with episode_status
+            # process_rules tags boxes with episode_status and returns events created this
+            # frame. We hold the frame here, so we crop each new detection for evidence,
+            # then notify (with the crop) and hand off to the autonomous worker if enabled.
+            new_events = process_rules(self.stream_id, boxes_data)
+            for event, box in new_events:
+                crop = _evidence_jpeg(frame, box)
+                if crop:
+                    state.store_event_crop(event["id"], crop)
+                notify_safety(event)
+                if state.autonomous_mode:
+                    autonomous.enqueue(event)
 
             state.latest_detections[self.stream_id] = [
                 {
@@ -144,7 +175,7 @@ class SmoothCameraManager:
                 continue
 
             for box in self.latest_boxes:
-                if box["class_name"] in CONTEXT_CLASSES and not state.is_context_visible(box["class_name"]):
+                if not state.is_class_visible(self.stream_id, box["class_name"]):
                     continue
 
                 coords = box["xyxy"]

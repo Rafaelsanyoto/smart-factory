@@ -60,6 +60,10 @@ DEFAULT_MODEL = "yolo26m"
 # external dispatch — the app runs fine without any of this configured.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
+# Separate model for the autonomous vision-verify path — it needs to actually SEE the
+# detection crop, so it must be a multimodal (vision-capable) model. Kept distinct from
+# GEMINI_MODEL (used for text chat) so each can be tuned independently.
+GEMINI_VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-flash-latest")
 # Notification channel — Discord webhook (one URL, no bot needed for outbound messages).
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 # Optional SECOND Discord channel, just for "action taken" updates — lets you split new
@@ -133,23 +137,61 @@ ALL_PPE = list(PPE_TO_VIOLATION.keys())
 EMERGENCY_CLASSES = {"Fire", "Smoke"}
 ALL_EMERGENCY = sorted(EMERGENCY_CLASSES)
 
-# Context classes: detectable, but never a compliance violation (no NO-* pair). Their
-# on/off toggle only controls display (bounding boxes + breakdown panel), not rule logic.
+# Context classes: detectable, but not a PPE-absence violation. Kept for reference/UI
+# grouping — display + monitoring is now controlled per-zone per-class (see below), not
+# via a single global toggle.
 CONTEXT_CLASSES = ["Person", "Safety Cone", "machinery", "vehicle"]
+
+# The full set of 12 classes the YOLO model can output (dataset order-independent — this
+# is the UI/config order: violations, emergencies, presence-triggerable, then neutral).
+# Every zone gets a per-class config entry for each of these.
+ALL_CLASSES = [
+    "NO-Hardhat", "NO-Mask", "NO-Safety Vest",   # PPE-absence violations
+    "Fire", "Smoke",                              # emergencies
+    "Person",                                     # presence-triggerable (e.g. restricted zone)
+    "Hardhat", "Mask", "Safety Vest",             # PPE-present (neutral by default)
+    "Safety Cone", "machinery", "vehicle",        # context objects
+]
+
+# Urgency tiers, low -> high. Drives notification style, whether the dashboard alarm/banner
+# fires, and how the autonomous agent escalates a confirmed incident.
+URGENCY_LEVELS = ("info", "warning", "critical")
+DEFAULT_URGENCY = "warning"
 
 import threading  # noqa: E402 — kept next to the lock it guards for readability
 context_lock = threading.Lock()
 
+
+def default_class_config(monitored):
+    """Build a full per-zone class config for all 12 classes. `monitored` maps the classes
+    that should trigger incidents to their urgency; everything else is display-only.
+
+    Each class entry: {display: show box on video, monitor: raise an incident, urgency}.
+    """
+    return {
+        cls: {
+            "display": True,
+            "monitor": cls in monitored,
+            "urgency": monitored.get(cls, "info"),
+        }
+        for cls in ALL_CLASSES
+    }
+
+
 DEFAULT_ZONE_RULES = {
     "stream_01": {
         "label": "Assembly Line A (Cam 01)",
-        "required": ["Hardhat", "Safety Vest"],
-        "emergency": ["Fire", "Smoke"],
+        "classes": default_class_config({
+            "NO-Hardhat": "warning", "NO-Safety Vest": "warning",
+            "Fire": "critical", "Smoke": "critical",
+        }),
     },
     "stream_02": {
         "label": "Welding Bay B (Cam 02)",
-        "required": ["Hardhat", "Mask", "Safety Vest"],
-        "emergency": ["Fire", "Smoke"],
+        "classes": default_class_config({
+            "NO-Hardhat": "warning", "NO-Mask": "warning", "NO-Safety Vest": "warning",
+            "Fire": "critical", "Smoke": "critical",
+        }),
     },
 }
 

@@ -183,6 +183,13 @@ export function AgentChatProvider({ children }) {
               patchMessage(agentId, (m) => ({ steps: [...m.steps, step] }));
               continue;
             }
+            if (step.step === 'saved') {
+              // The backend persisted the agent message — remember its real DB id so a
+              // pending action can be resolved against the actual row (not the client id),
+              // and any report files generated this turn (for a download button).
+              patchMessage(agentId, { serverId: step.agent_message_id, reports: step.reports || [] });
+              continue;
+            }
 
             patchMessage(agentId, {
               text: step.reply || '',
@@ -214,7 +221,10 @@ export function AgentChatProvider({ children }) {
       // though the action was already run or dismissed.
       patchMessage(msgId, { actionState: approve ? 'running' : 'cancelled' });
       try {
-        const res = await fetch(`${API_BASE}/api/agent/messages/${msgId}/resolve-action`, {
+        // Prefer the server-assigned id (set from the 'saved' step); for messages loaded
+        // from history, msgId already IS the DB id, so it falls back cleanly.
+        const targetId = msg.serverId || msgId;
+        const res = await fetch(`${API_BASE}/api/agent/messages/${targetId}/resolve-action`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ approve }),

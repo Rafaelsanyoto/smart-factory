@@ -1,13 +1,13 @@
-"""Health, DB info, model/confidence, zone rules, and context-class display endpoints."""
+"""Health, DB info, model/confidence, per-zone class rules, and autonomous-mode endpoints."""
 import os
 
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from ..config import MODEL_REGISTRY, DB_PATH, CONTEXT_CLASSES
-from ..database import db_conn, engine_lock
+from ..config import MODEL_REGISTRY, DB_PATH
+from ..database import db_conn, engine_lock, db_feedback_summary
 from .. import state
-from ..actions import apply_model, apply_confidence, apply_zone_rules, apply_context_visibility, zones_payload
+from ..actions import apply_model, apply_confidence, apply_zone_classes, apply_autonomous_mode, zones_payload
 
 router = APIRouter()
 
@@ -63,25 +63,31 @@ def get_zones():
     return zones_payload()
 
 
-class ZoneUpdate(BaseModel):
-    required: list[str] | None = None
-    emergency: list[str] | None = None
+class ZoneClassesUpdate(BaseModel):
+    # {class_name: {display?: bool, monitor?: bool, urgency?: "info"|"warning"|"critical"}}
+    classes: dict
 
 
 @router.post("/api/zones/{stream_id}")
-def update_zone(stream_id: str, req: ZoneUpdate):
-    return apply_zone_rules(stream_id, req.required, req.emergency)
+def update_zone(stream_id: str, req: ZoneClassesUpdate):
+    return apply_zone_classes(stream_id, req.classes)
 
 
-@router.get("/api/context-classes")
-def get_context_classes():
-    return {"classes": CONTEXT_CLASSES, "visible": dict(state.context_visibility)}
+@router.get("/api/system/autonomous")
+def get_autonomous():
+    return {"autonomous_mode": state.autonomous_mode}
 
 
-class ContextVisibilitySet(BaseModel):
-    visible: bool
+class AutonomousSet(BaseModel):
+    enabled: bool
 
 
-@router.post("/api/context-classes/{class_name}")
-def set_context_visibility(class_name: str, req: ContextVisibilitySet):
-    return apply_context_visibility(class_name, req.visible)
+@router.post("/api/system/autonomous")
+def set_autonomous(req: AutonomousSet):
+    return apply_autonomous_mode(req.enabled)
+
+
+@router.get("/api/system/agent-feedback")
+def agent_feedback():
+    with engine_lock:
+        return db_feedback_summary()

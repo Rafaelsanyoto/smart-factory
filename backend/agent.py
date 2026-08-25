@@ -3,16 +3,32 @@ inline (safe). ACTION tools are gated by the permission mode: in 'standard' they
 to the UI as a pending action a human confirms; in 'accept_low_risk' the low-risk ones run
 inline; in 'auto' everything runs inline. Chat history is persisted per session so it
 survives restarts and gives the Discord bot real multi-turn memory."""
+import threading
 import time
 
 from .config import GEMINI_API_KEY, GEMINI_MODEL
 from .database import (
-    engine_lock, db_conn, _event_row_to_dict, db_get_notifications,
+    engine_lock, db_conn, _event_row_to_dict, db_get_notifications, db_update_event,
     db_insert_message, db_get_session, db_touch_session, db_get_messages,
+    db_get_message, db_update_message_pending_action, db_feedback_summary,
 )
 from . import state
 from . import actions
+from . import followup
+from . import reports
 from .notifications import dispatch_message
+
+REPORT_URL_BASE = "http://127.0.0.1:8000/api/reports/file"
+
+# Report files generated during the CURRENT chat turn — collected per-thread so the caller
+# (streaming UI / Discord bot) can offer a download button / attach the file.
+_turn = threading.local()
+
+
+def _turn_report_files():
+    if not hasattr(_turn, "files"):
+        _turn.files = []
+    return _turn.files
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +83,83 @@ def _agent_get_system_config():
     return {
         "active_model": state.active_model_id,
         "confidence": state.active_confidence,
-        "context_visible": dict(state.context_visibility),
+        "autonomous_mode": state.autonomous_mode,
+        "permission_mode": state.agent_permission_mode,
     }
+
+
+def _find_event_by_seq(seq):
+    try:
+        seq = int(seq)
+    except (TypeError, ValueError):
+        return None
+    with engine_lock:
+        row = db_conn.execute("SELECT * FROM events WHERE seq = ?", (seq,)).fetchone()
+    return _event_row_to_dict(row) if row else None
+
+
+def _agent_verify_incident(seq, status):
+    status = str(status).upper()
+    if status not in ("CONFIRMED", "DISMISSED"):
+        return {"status": "error", "message": "status harus CONFIRMED atau DISMISSED"}
+    ev = _find_event_by_seq(seq)
+    if not ev:
+        return {"status": "error", "message": f"insiden #{seq} tidak ditemukan"}
+    # A chat-initiated verify is a HUMAN decision routed through the agent — don't tag it
+    # verified_by="agent" (that marker is reserved for autonomous confirmations, so the
+    # feedback/accuracy metric stays meaningful). Dismissal still routes through followup.
+    if status == "DISMISSED":
+        updated = followup.dismiss_with_feedback(ev["id"], "agent", "Ditolak via AI Agent (perintah user)")
+    else:
+        with engine_lock:
+            updated = db_update_event(ev["id"], status="CONFIRMED", verified_at=time.strftime("%H:%M:%S"))
+    return {"status": "success", "message": f"Insiden #{seq} ditandai {status}.", "event": updated}
+
+
+def _agent_record_action(seq, note):
+    note = str(note).strip()
+    if not note:
+        return {"status": "error", "message": "catatan tindakan tidak boleh kosong"}
+    ev = _find_event_by_seq(seq)
+    if not ev:
+        return {"status": "error", "message": f"insiden #{seq} tidak ditemukan"}
+    if ev["status"] != "CONFIRMED":
+        return {"status": "error", "message": f"hanya insiden CONFIRMED yang bisa dicatat tindakannya (#{seq} berstatus {ev['status']})"}
+    updated = followup.mark_acted(ev["id"], note)  # shared with web form + Discord ✅
+    return {"status": "success", "message": f"Tindakan untuk insiden #{seq} dicatat.", "event": updated}
+
+
+def _agent_get_feedback():
+    with engine_lock:
+        return db_feedback_summary()
+
+
+def _agent_export_report(file_format="pdf", since_hours=24, zone=""):
+    res = reports.generate_report_file(file_format, since_hours, zone)
+    if res.get("status") == "success":
+        url = f"{REPORT_URL_BASE}/{res['filename']}"
+        res["download_url"] = url
+        _turn_report_files().append({
+            "filename": res["filename"], "path": res["path"],
+            "download_url": url, "format": res["format"],
+        })
+        res["message"] = (
+            f"Laporan {res['format'].upper()} siap ({res['total']} insiden, "
+            f"{res['period_hours']} jam terakhir). Unduh: {url}"
+        )
+    return res
+
+
+def _apply_zone_classes_from_updates(stream_id, updates):
+    """Convert the agent's array-of-objects form into the {class: {...}} dict apply_zone_classes
+    expects (Gemini function calling handles arrays of objects better than open-keyed maps)."""
+    classes = {}
+    for u in (updates or []):
+        name = u.get("class_name")
+        if not name:
+            continue
+        classes[name] = {k: v for k, v in u.items() if k != "class_name"}
+    return actions.apply_zone_classes(stream_id, classes)
 
 
 def _agent_generate_report(since_hours=24, zone=""):
@@ -134,31 +225,40 @@ READ_TOOLS = {
     "get_stream_status": _agent_get_stream_status,
     "get_system_config": _agent_get_system_config,
     "generate_report": lambda since_hours=24, zone="": _agent_generate_report(since_hours, zone),
+    "get_agent_feedback": lambda: _agent_get_feedback(),
+    "export_report": lambda file_format="pdf", since_hours=24, zone="": _agent_export_report(file_format, since_hours, zone),
 }
 
 ACTION_TOOLS = {
     "send_alert_message": lambda text: _agent_send_alert(text),
-    "set_zone_rules": lambda stream_id, required=None, emergency=None: actions.apply_zone_rules(stream_id, required, emergency),
+    "set_zone_classes": lambda stream_id, updates: _apply_zone_classes_from_updates(stream_id, updates),
     "set_confidence": lambda confidence: actions.apply_confidence(confidence),
     "set_stream_paused": lambda stream_id, paused: actions.apply_pause(stream_id, paused),
+    "set_stream_source": lambda stream_id, source: actions.apply_source(stream_id, source),
     "select_model": lambda model_id: actions.apply_model(model_id),
-    "set_context_visibility": lambda class_name, visible: actions.apply_context_visibility(class_name, visible),
+    "set_autonomous_mode": lambda enabled: actions.apply_autonomous_mode(enabled),
     "set_agent_permission_mode": lambda mode: actions.apply_permission_mode(mode),
+    "verify_incident": lambda seq, status: _agent_verify_incident(seq, status),
+    "record_action": lambda seq, note: _agent_record_action(seq, note),
 }
 
 # Risk tier per action tool, used by the permission-mode auto-run decision below.
-# "low": can't affect what gets detected as a violation/emergency — safe to auto-run.
-# "high": changes actual detection behavior (what's required, how sensitive, whether a
-# camera is even running) — a misinterpreted command here could mean a real violation or
-# emergency goes undetected, so it stays gated behind confirmation unless the operator
-# has explicitly opted into Full Auto.
+# "low": can't affect what gets detected as a violation/emergency, and is easily reversible
+# — safe to auto-run under accept_low_risk.
+# "high": changes actual detection behavior (what's monitored, how sensitive, source/model,
+# camera on/off, how autonomous the agent itself is) — a misinterpreted command here could
+# mean a real violation or emergency goes undetected, so it stays gated behind confirmation
+# unless the operator has explicitly opted into Full Auto.
 ACTION_RISK = {
     "send_alert_message": "low",
-    "set_context_visibility": "low",
-    "set_zone_rules": "high",
+    "record_action": "low",       # documenting remediation on an already-CONFIRMED incident
+    "set_zone_classes": "high",
     "set_confidence": "high",
     "set_stream_paused": "high",
+    "set_stream_source": "high",
     "select_model": "high",
+    "set_autonomous_mode": "high",
+    "verify_incident": "high",     # can flip an incident to DISMISSED — must be confirmed
     # High even though it's "just" a settings toggle — changing this decides how
     # autonomous FUTURE actions become, so it defaults to needing confirmation too.
     # Only auto-runs itself once already in "auto" mode.
@@ -199,8 +299,23 @@ AGENT_FUNCTION_DECLARATIONS = [
      "parameters": {"type": "OBJECT", "properties": {}}},
     {"name": "get_stream_status", "description": "Ambil status tiap stream/kamera: sumber (video/webcam) dan apakah sedang di-pause.",
      "parameters": {"type": "OBJECT", "properties": {}}},
-    {"name": "get_system_config", "description": "Ambil konfigurasi sistem: model deteksi aktif, confidence threshold, visibilitas kelas konteks.",
+    {"name": "get_system_config", "description": "Ambil konfigurasi sistem: model deteksi aktif, confidence threshold, mode otonom, permission mode.",
      "parameters": {"type": "OBJECT", "properties": {}}},
+    {"name": "get_agent_feedback", "description": "Ambil akurasi mode otonom: berapa insiden yang di-CONFIRM AI, berapa yang ternyata keliru (dibatalkan manusia), dan daftar koreksi terbaru.",
+     "parameters": {"type": "OBJECT", "properties": {}}},
+    {
+        "name": "export_report",
+        "description": (
+            "Buat FILE laporan keselamatan yang bisa diunduh (PDF / Excel / CSV) untuk periode "
+            "tertentu. Pakai ini kalau user minta laporan dalam bentuk FILE/DOKUMEN (bukan sekadar "
+            "teks atau ringkasan). Setelah dibuat, sampaikan bahwa file siap diunduh."
+        ),
+        "parameters": {"type": "OBJECT", "properties": {
+            "file_format": {"type": "STRING", "description": "'pdf', 'xlsx' (Excel), atau 'csv'. Default 'pdf'."},
+            "since_hours": {"type": "NUMBER", "description": "Rentang jam: 24 = hari ini, 168 = seminggu. Default 24."},
+            "zone": {"type": "STRING", "description": "Filter zona/stream tertentu. Kosongkan untuk semua zona."},
+        }},
+    },
     {
         "name": "generate_report",
         "description": (
@@ -222,13 +337,21 @@ AGENT_FUNCTION_DECLARATIONS = [
         }, "required": ["text"]},
     },
     {
-        "name": "set_zone_rules",
-        "description": "Ubah aturan sebuah zona. stream_01=Assembly Line A, stream_02=Welding Bay B.",
+        "name": "set_zone_classes",
+        "description": (
+            "Atur kelas mana yang dimonitor (memicu insiden), urgensinya, dan apakah ditampilkan "
+            "di layar, untuk sebuah zona. Contoh: jadikan zona restricted dengan memonitor 'Person' "
+            "urgensi critical. stream_01=Assembly Line A, stream_02=Welding Bay B."
+        ),
         "parameters": {"type": "OBJECT", "properties": {
             "stream_id": {"type": "STRING", "description": "'stream_01' atau 'stream_02'."},
-            "required": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Daftar PPE wajib: Hardhat, Mask, Safety Vest. Hilangkan bila tak diubah."},
-            "emergency": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Daftar kelas darurat aktif: Fire, Smoke. Hilangkan bila tak diubah."},
-        }, "required": ["stream_id"]},
+            "updates": {"type": "ARRAY", "description": "Daftar perubahan per kelas.", "items": {"type": "OBJECT", "properties": {
+                "class_name": {"type": "STRING", "description": "Salah satu: NO-Hardhat, NO-Mask, NO-Safety Vest, Fire, Smoke, Person, Hardhat, Mask, Safety Vest, Safety Cone, machinery, vehicle."},
+                "monitor": {"type": "BOOLEAN", "description": "true = jadikan pemicu insiden, false = tidak."},
+                "urgency": {"type": "STRING", "description": "'info', 'warning', atau 'critical'."},
+                "display": {"type": "BOOLEAN", "description": "true = tampilkan box di video, false = sembunyikan."},
+            }, "required": ["class_name"]}},
+        }, "required": ["stream_id", "updates"]},
     },
     {
         "name": "set_confidence",
@@ -239,11 +362,19 @@ AGENT_FUNCTION_DECLARATIONS = [
     },
     {
         "name": "set_stream_paused",
-        "description": "Pause atau resume sebuah stream/kamera.",
+        "description": "Pause atau resume (nyalakan/matikan pemrosesan) sebuah stream/kamera.",
         "parameters": {"type": "OBJECT", "properties": {
             "stream_id": {"type": "STRING", "description": "'stream_01' atau 'stream_02'."},
-            "paused": {"type": "BOOLEAN", "description": "true = pause, false = resume."},
+            "paused": {"type": "BOOLEAN", "description": "true = pause/matikan, false = resume/nyalakan."},
         }, "required": ["stream_id", "paused"]},
+    },
+    {
+        "name": "set_stream_source",
+        "description": "Ganti sumber input sebuah stream ke webcam atau file video yang tersedia.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "stream_id": {"type": "STRING", "description": "'stream_01' atau 'stream_02'."},
+            "source": {"type": "STRING", "description": "'Webcam' atau nama file video (mis. 'WIN_20260821_01_16_00_Pro.mp4'). Cek get_stream_status untuk daftar opsi."},
+        }, "required": ["stream_id", "source"]},
     },
     {
         "name": "select_model",
@@ -253,12 +384,31 @@ AGENT_FUNCTION_DECLARATIONS = [
         }, "required": ["model_id"]},
     },
     {
-        "name": "set_context_visibility",
-        "description": "Tampilkan/sembunyikan kelas konteks di overlay: Person, Safety Cone, machinery, vehicle.",
+        "name": "set_autonomous_mode",
+        "description": (
+            "Nyalakan/matikan mode penanganan insiden otonom. Saat ON, AI memverifikasi setiap "
+            "deteksi baru secara visual lalu meng-CONFIRM & eskalasi otomatis (tidak pernah "
+            "auto-dismiss; yang ragu diserahkan ke manusia)."
+        ),
         "parameters": {"type": "OBJECT", "properties": {
-            "class_name": {"type": "STRING", "description": "Person, Safety Cone, machinery, atau vehicle."},
-            "visible": {"type": "BOOLEAN", "description": "true = tampilkan, false = sembunyikan."},
-        }, "required": ["class_name", "visible"]},
+            "enabled": {"type": "BOOLEAN", "description": "true = nyalakan mode otonom, false = matikan."},
+        }, "required": ["enabled"]},
+    },
+    {
+        "name": "verify_incident",
+        "description": "Tandai sebuah insiden (berdasar nomor seq) sebagai CONFIRMED (pelanggaran asli) atau DISMISSED (salah deteksi).",
+        "parameters": {"type": "OBJECT", "properties": {
+            "seq": {"type": "INTEGER", "description": "Nomor insiden, mis. 7 untuk #7."},
+            "status": {"type": "STRING", "description": "'CONFIRMED' atau 'DISMISSED'."},
+        }, "required": ["seq", "status"]},
+    },
+    {
+        "name": "record_action",
+        "description": "Catat tindakan remediasi pada insiden CONFIRMED (berdasar nomor seq). Mengirim update ke channel tindakan.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "seq": {"type": "INTEGER", "description": "Nomor insiden, mis. 7 untuk #7."},
+            "note": {"type": "STRING", "description": "Deskripsi tindakan yang dilakukan."},
+        }, "required": ["seq", "note"]},
     },
     {
         "name": "set_agent_permission_mode",
@@ -296,6 +446,10 @@ AGENT_SYSTEM_PROMPT = (
     "satu hasil akhir: tindakan nyata ATAU dihapus sebagai duplikat, tidak keduanya. Kalau ditanya "
     "status suatu insiden atau tindakan apa yang diambil, gunakan get_events dan baca field "
     "status/action_taken/action_note/action_at/deleted/delete_reason — jangan mengarang. "
+    "Kamu BOLEH mengubah status insiden atas perintah user: pakai verify_incident untuk "
+    "CONFIRMED/DISMISSED, dan record_action untuk mencatat tindakan. Kalau user bilang sebuah "
+    "insiden sudah ditindak dengan alasan tertentu, panggil verify_incident(CONFIRMED) lalu "
+    "record_action dengan alasan itu — dalam urutan tersebut. "
     "Kalau diminta membuat laporan/ringkasan/rekap keselamatan untuk suatu periode (hari ini, "
     "minggu ini, dst), pakai generate_report (bukan get_events) lalu susun jadi laporan naratif "
     "yang jelas: total insiden, tren per kelas/zona, jumlah darurat, dan soroti insiden CONFIRMED "
@@ -306,13 +460,19 @@ AGENT_SYSTEM_PROMPT = (
 def describe_action(name, args):
     if name == "send_alert_message":
         return f'Kirim pesan ke channel safety:\n"{args.get("text", "")}"'
-    if name == "set_zone_rules":
+    if name == "set_zone_classes":
         parts = []
-        if args.get("required") is not None:
-            parts.append(f"PPE wajib = {args.get('required')}")
-        if args.get("emergency") is not None:
-            parts.append(f"deteksi darurat = {args.get('emergency')}")
-        return f"Ubah aturan zona {args.get('stream_id')}: " + (", ".join(parts) if parts else "(tidak ada perubahan)")
+        for u in (args.get("updates") or []):
+            cls = u.get("class_name", "?")
+            bits = []
+            if "monitor" in u:
+                bits.append("monitor ON" if u["monitor"] else "monitor OFF")
+            if u.get("urgency"):
+                bits.append(f"urgensi {u['urgency']}")
+            if "display" in u:
+                bits.append("tampil" if u["display"] else "sembunyi")
+            parts.append(f"{cls} ({', '.join(bits)})" if bits else cls)
+        return f"Ubah kelas zona {args.get('stream_id')}: " + (", ".join(parts) if parts else "(tidak ada perubahan)")
     if name == "set_confidence":
         try:
             pct = round(float(args.get("confidence", 0)) * 100)
@@ -321,10 +481,16 @@ def describe_action(name, args):
         return f"Ubah confidence threshold ke {pct}%"
     if name == "set_stream_paused":
         return f"{'Pause' if args.get('paused') else 'Resume'} stream {args.get('stream_id')}"
+    if name == "set_stream_source":
+        return f"Ganti sumber stream {args.get('stream_id')} ke '{args.get('source')}'"
     if name == "select_model":
         return f"Ganti model deteksi ke {args.get('model_id')}"
-    if name == "set_context_visibility":
-        return f"{'Tampilkan' if args.get('visible') else 'Sembunyikan'} kelas '{args.get('class_name')}' di layar"
+    if name == "set_autonomous_mode":
+        return f"{'Nyalakan' if args.get('enabled') else 'Matikan'} mode penanganan insiden otonom"
+    if name == "verify_incident":
+        return f"Tandai insiden #{args.get('seq')} sebagai {args.get('status')}"
+    if name == "record_action":
+        return f"Catat tindakan untuk insiden #{args.get('seq')}: \"{args.get('note', '')}\""
     if name == "set_agent_permission_mode":
         labels = {"standard": "Standard (selalu konfirmasi)", "accept_low_risk": "Accept Low-Risk (aksi aman otomatis)", "auto": "Full Auto (semua otomatis)"}
         return f"Ubah mode izin AI Agent ke: {labels.get(args.get('mode'), args.get('mode'))}"
@@ -347,6 +513,13 @@ def _summarize_tool_result(name, result):
             return f"model aktif: {result.get('active_model')}, confidence: {result.get('confidence')}"
         if name == "generate_report":
             return f"{result['total_events']} insiden dalam {result['period_hours']} jam terakhir, {len(result['unresolved_confirmed_incidents'])} belum ditindak"
+        if name == "get_agent_feedback":
+            acc = result.get("accuracy")
+            return f"akurasi otonom: {round(acc*100)}% ({result.get('mistakes')} koreksi)" if acc is not None else "belum ada data otonom"
+        if name == "export_report":
+            if result.get("status") == "success":
+                return f"file {result['format'].upper()} dibuat ({result.get('total')} insiden)"
+            return result.get("message", "gagal membuat laporan")
     except Exception:
         pass
     return "selesai"
@@ -359,6 +532,8 @@ TOOL_LABELS = {
     "generate_report": "Menyusun statistik laporan",
     "get_stream_status": "Mengecek status stream/kamera",
     "get_system_config": "Mengecek konfigurasi sistem",
+    "get_agent_feedback": "Mengecek akurasi mode otonom",
+    "export_report": "Membuat file laporan",
 }
 
 
@@ -469,6 +644,7 @@ def run_agent_chat_session(session_id, user_text):
     final reply — together with its full step trail — back to the session. Yields the
     same step stream as run_agent_chat_steps, so both streaming and non-streaming callers
     (dashboard UI, plain HTTP, Discord bot) work exactly as before at the call site."""
+    _turn.files = []  # reset per-turn report collector
     with engine_lock:
         db_insert_message(session_id, "user", user_text)
         session = db_get_session(session_id)
@@ -489,20 +665,81 @@ def run_agent_chat_session(session_id, user_text):
             final_step = step
         yield step
 
+    turn_reports = list(getattr(_turn, "files", []))
     if final_step:
         with engine_lock:
-            db_insert_message(
+            agent_message_id = db_insert_message(
                 session_id, "agent", final_step.get("reply", ""),
                 steps=collected_steps, pending_action=final_step.get("pending_action"),
             )
+        # Emit the persisted message id (so callers can resolve its pending action against
+        # the real DB row) plus any report files generated this turn (for a download button
+        # / Discord attachment).
+        yield {
+            "step": "saved",
+            "agent_message_id": agent_message_id,
+            "pending_action": final_step.get("pending_action"),
+            "reports": turn_reports,
+        }
+
+
+_TERMINAL_STEPS = ("final", "action_proposed", "error", "not_configured")
 
 
 def run_agent_chat_session_final(session_id, user_text):
-    """Drains the step generator, returns only the final step (+ session_id). Used by
-    the plain HTTP endpoint and the Discord bot — both just want a one-shot answer."""
-    last = None
+    """Drains the step generator, returns the meaningful final step plus the persisted
+    agent_message_id and session_id. Used by the plain HTTP endpoint and the Discord bot."""
+    result = {"configured": False, "reply": "", "pending_action": None}
+    agent_message_id = None
+    turn_reports = []
     for step in run_agent_chat_session(session_id, user_text):
-        last = step
-    result = last or {"configured": False, "reply": "", "pending_action": None}
+        if step["step"] == "saved":
+            agent_message_id = step.get("agent_message_id")
+            turn_reports = step.get("reports") or []
+        elif step["step"] in _TERMINAL_STEPS:
+            result = step
+    result = dict(result)
     result["session_id"] = session_id
+    result["agent_message_id"] = agent_message_id
+    result["reports"] = turn_reports
     return result
+
+
+def resolve_pending_action(message_id, approve):
+    """Execute or cancel a message's pending action, recording the outcome on the message
+    (state: done/failed/cancelled). Shared by the web resolve endpoint AND the Discord
+    confirm buttons so both behave identically. Returns {ok, message, pending_action}."""
+    with engine_lock:
+        msg = db_get_message(message_id)
+        if not msg:
+            return {"ok": False, "message": "Pesan tidak ditemukan.", "pending_action": None}
+        pending = msg.get("pending_action")
+        if not pending:
+            return {"ok": False, "message": "Pesan ini tidak punya aksi tertunda.", "pending_action": None}
+        if pending.get("state") and pending["state"] != "awaiting":
+            return {"ok": False, "message": "Aksi ini sudah diproses sebelumnya.", "pending_action": pending}
+
+        if not approve:
+            pending["state"] = "cancelled"
+            db_update_message_pending_action(message_id, pending)
+            return {"ok": True, "message": "Aksi dibatalkan.", "pending_action": pending}
+
+        tool = pending.get("tool")
+        args = pending.get("args") or {}
+        if tool not in ACTION_TOOLS:
+            pending["state"] = "failed"
+            pending["result"] = "Aksi tidak dikenal atau tidak diizinkan."
+            db_update_message_pending_action(message_id, pending)
+            return {"ok": False, "message": pending["result"], "pending_action": pending}
+
+        try:
+            result = ACTION_TOOLS[tool](**args)
+            ok = result.get("status") != "error"
+        except TypeError as e:
+            ok = False
+            result = {"message": f"Argumen tidak valid: {e}"}
+
+        pending["state"] = "done" if ok else "failed"
+        pending["result"] = result.get("message") or ("Aksi berhasil dijalankan." if ok else "Aksi gagal.")
+        db_update_message_pending_action(message_id, pending)
+        return {"ok": ok, "message": pending["result"], "pending_action": pending}

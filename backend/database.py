@@ -14,7 +14,10 @@ import threading
 import time
 import uuid
 
-from .config import DB_PATH, DEFAULT_ZONE_RULES, DEFAULT_MODEL, CONTEXT_CLASSES
+from .config import (
+    DB_PATH, DEFAULT_ZONE_RULES, DEFAULT_MODEL,
+    PPE_TO_VIOLATION, EMERGENCY_CLASSES, default_class_config,
+)
 
 db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 db_conn.row_factory = sqlite3.Row
@@ -47,7 +50,11 @@ def init_db():
             action_at TEXT,
             deleted INTEGER NOT NULL DEFAULT 0,
             delete_reason TEXT,
-            deleted_at TEXT
+            deleted_at TEXT,
+            urgency TEXT,
+            verified_by TEXT,
+            agent_verdict TEXT,
+            agent_reasoning TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
         CREATE INDEX IF NOT EXISTS idx_events_ts_ms ON events(ts_ms);
@@ -68,8 +75,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS zone_rules (
             stream_id TEXT PRIMARY KEY,
             label TEXT NOT NULL,
-            required_ppe TEXT NOT NULL,
-            emergency_classes TEXT NOT NULL
+            monitored_classes TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS system_config (
@@ -99,6 +105,20 @@ def init_db():
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id);
+
+        CREATE TABLE IF NOT EXISTS agent_feedback (
+            id TEXT PRIMARY KEY,
+            event_id TEXT,
+            seq INTEGER,
+            class TEXT,
+            zone TEXT,
+            agent_verdict TEXT,
+            agent_reasoning TEXT,
+            human_decision TEXT,
+            source TEXT,
+            image_path TEXT,
+            created_at TEXT NOT NULL
+        );
     """)
     db_conn.commit()
 
@@ -108,9 +128,9 @@ def _seed_defaults():
     there's something sensible to load before an admin ever changes anything."""
     if db_conn.execute("SELECT COUNT(*) c FROM zone_rules").fetchone()["c"] == 0:
         db_conn.executemany(
-            "INSERT INTO zone_rules (stream_id, label, required_ppe, emergency_classes) VALUES (?,?,?,?)",
+            "INSERT INTO zone_rules (stream_id, label, monitored_classes) VALUES (?,?,?)",
             [
-                (sid, rule["label"], json.dumps(rule["required"]), json.dumps(rule["emergency"]))
+                (sid, rule["label"], json.dumps(rule["classes"]))
                 for sid, rule in DEFAULT_ZONE_RULES.items()
             ],
         )
@@ -120,10 +140,79 @@ def _seed_defaults():
             [
                 ("active_model_id", DEFAULT_MODEL),
                 ("active_confidence", "0.25"),
-                ("context_visibility", json.dumps({c: True for c in CONTEXT_CLASSES})),
                 ("event_seq_counter", "0"),
+                ("autonomous_mode", "off"),
             ],
         )
+    db_conn.commit()
+
+
+def _table_columns(table):
+    return {r["name"] for r in db_conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_db():
+    """Upgrade an existing DB in place to the current schema. Idempotent — safe to run on
+    every startup. Covers two changes:
+      1. events: add urgency / verified_by / agent_verdict / agent_reasoning columns.
+      2. zone_rules: convert the old {required_ppe, emergency_classes} shape into the new
+         per-class {monitored_classes} shape (display/monitor/urgency per class per zone).
+    """
+    # 1. events — additive columns are easy (nullable ALTER ADD).
+    event_cols = _table_columns("events")
+    for col in ("urgency", "verified_by", "agent_verdict", "agent_reasoning"):
+        if col not in event_cols:
+            db_conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+
+    # New system_config keys don't get picked up by _seed_defaults on an existing DB (it
+    # only seeds when the table is empty), so ensure any added keys exist here.
+    if db_conn.execute("SELECT 1 FROM system_config WHERE key = 'autonomous_mode'").fetchone() is None:
+        db_conn.execute("INSERT INTO system_config (key, value) VALUES ('autonomous_mode', 'off')")
+
+    # 2. zone_rules — old schema had required_ppe + emergency_classes and no
+    #    monitored_classes. Rebuild each row into the per-class config, preserving intent:
+    #    NO-* of required PPE -> monitor=warning, Fire/Smoke -> monitor=critical, and the
+    #    old global context_visibility decides each class's display flag.
+    zone_cols = _table_columns("zone_rules")
+    if "monitored_classes" not in zone_cols and "required_ppe" in zone_cols:
+        old_visibility = {}
+        vis_row = db_conn.execute(
+            "SELECT value FROM system_config WHERE key = 'context_visibility'"
+        ).fetchone()
+        if vis_row:
+            try:
+                old_visibility = json.loads(vis_row["value"])
+            except (TypeError, ValueError):
+                old_visibility = {}
+
+        old_rows = db_conn.execute(
+            "SELECT stream_id, label, required_ppe, emergency_classes FROM zone_rules"
+        ).fetchall()
+        migrated = []
+        for r in old_rows:
+            required = json.loads(r["required_ppe"] or "[]")
+            emergency = json.loads(r["emergency_classes"] or "[]")
+            monitored = {PPE_TO_VIOLATION[p]: "warning" for p in required if p in PPE_TO_VIOLATION}
+            for c in emergency:
+                if c in EMERGENCY_CLASSES:
+                    monitored[c] = "critical"
+            classes = default_class_config(monitored)
+            # honor the old global display toggle where it was explicitly set
+            for cls, cfg in classes.items():
+                if cls in old_visibility:
+                    cfg["display"] = bool(old_visibility[cls])
+            migrated.append((r["stream_id"], r["label"], json.dumps(classes)))
+
+        db_conn.execute("ALTER TABLE zone_rules RENAME TO zone_rules_old")
+        db_conn.execute(
+            "CREATE TABLE zone_rules (stream_id TEXT PRIMARY KEY, label TEXT NOT NULL, "
+            "monitored_classes TEXT NOT NULL)"
+        )
+        db_conn.executemany(
+            "INSERT INTO zone_rules (stream_id, label, monitored_classes) VALUES (?,?,?)", migrated
+        )
+        db_conn.execute("DROP TABLE zone_rules_old")
+
     db_conn.commit()
 
 
@@ -142,12 +231,12 @@ def db_load_config(key, default=None):
     return row["value"] if row else default
 
 
-def db_save_zone_rules(stream_id, label, required, emergency):
+def db_save_zone_classes(stream_id, label, classes):
     db_conn.execute(
-        "INSERT INTO zone_rules (stream_id, label, required_ppe, emergency_classes) VALUES (?,?,?,?) "
-        "ON CONFLICT(stream_id) DO UPDATE SET label=excluded.label, required_ppe=excluded.required_ppe, "
-        "emergency_classes=excluded.emergency_classes",
-        (stream_id, label, json.dumps(required), json.dumps(emergency)),
+        "INSERT INTO zone_rules (stream_id, label, monitored_classes) VALUES (?,?,?) "
+        "ON CONFLICT(stream_id) DO UPDATE SET label=excluded.label, "
+        "monitored_classes=excluded.monitored_classes",
+        (stream_id, label, json.dumps(classes)),
     )
     db_conn.commit()
 
@@ -157,8 +246,7 @@ def db_load_zone_rules():
     return {
         r["stream_id"]: {
             "label": r["label"],
-            "required": json.loads(r["required_ppe"]),
-            "emergency": json.loads(r["emergency_classes"]),
+            "classes": json.loads(r["monitored_classes"]),
         }
         for r in rows
     }
@@ -190,12 +278,15 @@ def db_insert_event(event):
     db_conn.execute(
         """INSERT INTO events (id, seq, timestamp, ts_ms, stream_id, zone, type, class,
            track_id, confidence, status, verified_at, action_taken, action_note, action_at,
-           deleted, delete_reason, deleted_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           deleted, delete_reason, deleted_at, urgency, verified_by, agent_verdict,
+           agent_reasoning) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             event["id"], event["seq"], event["timestamp"], event["ts_ms"], event["stream_id"],
             event["zone"], event["type"], event["class"], event["track_id"], event["confidence"],
             event["status"], event["verified_at"], int(event["action_taken"]), event["action_note"],
             event["action_at"], int(event["deleted"]), event["delete_reason"], event["deleted_at"],
+            event.get("urgency"), event.get("verified_by"), event.get("agent_verdict"),
+            event.get("agent_reasoning"),
         ),
     )
     db_conn.commit()
@@ -234,6 +325,53 @@ def db_insert_notification(note):
 def db_get_notifications(limit=200):
     rows = db_conn.execute("SELECT * FROM notifications ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
     return [_notif_row_to_dict(r) for r in rows]
+
+
+def db_get_awaiting_action():
+    """CONFIRMED incidents that haven't had a remediation recorded yet — the set the
+    reminder loop nags about until someone acts (or dismisses)."""
+    rows = db_conn.execute(
+        "SELECT * FROM events WHERE status='CONFIRMED' AND action_taken=0 AND deleted=0 ORDER BY ts_ms ASC"
+    ).fetchall()
+    return [_event_row_to_dict(r) for r in rows]
+
+
+# --- AI feedback: when a human overrides an agent's CONFIRM (dismisses it), that's a
+# labeled "the AI got this wrong" example — captured here (with the evidence image) as an
+# accuracy signal and a hard-case dataset for later prompt/threshold tuning. ---------
+def db_insert_feedback(event, human_decision, source, image_path=None):
+    fid = str(uuid.uuid4())
+    db_conn.execute(
+        """INSERT INTO agent_feedback (id, event_id, seq, class, zone, agent_verdict,
+           agent_reasoning, human_decision, source, image_path, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            fid, event.get("id"), event.get("seq"), event.get("class"), event.get("zone"),
+            event.get("agent_verdict"), event.get("agent_reasoning"), human_decision, source,
+            image_path, time.strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    db_conn.commit()
+    return fid
+
+
+def db_feedback_summary(limit=50):
+    agent_confirmed = db_conn.execute(
+        "SELECT COUNT(*) c FROM events WHERE verified_by='agent' AND agent_verdict='real'"
+    ).fetchone()["c"]
+    mistakes = db_conn.execute(
+        "SELECT COUNT(*) c FROM agent_feedback WHERE human_decision='DISMISSED'"
+    ).fetchone()["c"]
+    rows = db_conn.execute(
+        "SELECT * FROM agent_feedback ORDER BY rowid DESC LIMIT ?", (limit,)
+    ).fetchall()
+    accuracy = round((agent_confirmed - mistakes) / agent_confirmed, 3) if agent_confirmed else None
+    return {
+        "agent_confirmed": agent_confirmed,
+        "mistakes": mistakes,
+        "accuracy": accuracy,
+        "recent": [dict(r) for r in rows],
+    }
 
 
 def db_update_notification(note_id, **fields):
@@ -380,7 +518,8 @@ def db_prune_sessions(source):
     db_conn.commit()
 
 
-# Build/seed the schema at import so state.py (which loads config out of it) and every
-# db_* caller can assume the tables exist.
+# Build/migrate/seed the schema at import so state.py (which loads config out of it) and
+# every db_* caller can assume the current schema exists.
 init_db()
+_migrate_db()
 _seed_defaults()

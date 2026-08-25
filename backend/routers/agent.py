@@ -9,13 +9,14 @@ from pydantic import BaseModel
 from ..config import GEMINI_API_KEY, PERMISSION_MODES
 from ..database import (
     engine_lock, db_create_session, db_get_session, db_get_sessions, db_delete_session,
-    db_get_messages, db_get_message, db_update_message_pending_action, MAX_MESSAGES_PER_SESSION,
+    db_get_messages, MAX_MESSAGES_PER_SESSION,
 )
 from .. import state
 from ..notifications import configured_channel
 from ..actions import apply_permission_mode
 from ..agent import (
     ACTION_TOOLS, ACTION_RISK, run_agent_chat_session, run_agent_chat_session_final,
+    resolve_pending_action,
 )
 
 router = APIRouter()
@@ -79,41 +80,14 @@ class ResolveActionRequest(BaseModel):
 @router.post("/api/agent/messages/{message_id}/resolve-action")
 def resolve_message_action(message_id: str, req: ResolveActionRequest):
     """Records what happened to a proposed action directly on the chat message, so
-    reloading the session shows the real outcome instead of "Awaiting" forever."""
-    with engine_lock:
-        msg = db_get_message(message_id)
-        if not msg:
-            return {"status": "error", "message": "Pesan tidak ditemukan."}
-        pending = msg.get("pending_action")
-        if not pending:
-            return {"status": "error", "message": "Pesan ini tidak punya aksi tertunda."}
-        if pending.get("state") and pending["state"] != "awaiting":
-            return {"status": "error", "message": "Aksi ini sudah diproses sebelumnya.", "pending_action": pending}
-
-        if not req.approve:
-            pending["state"] = "cancelled"
-            db_update_message_pending_action(message_id, pending)
-            return {"status": "success", "pending_action": pending}
-
-        tool = pending.get("tool")
-        args = pending.get("args") or {}
-        if tool not in ACTION_TOOLS:
-            pending["state"] = "failed"
-            pending["result"] = "Aksi tidak dikenal atau tidak diizinkan."
-            db_update_message_pending_action(message_id, pending)
-            return {"status": "error", "message": pending["result"], "pending_action": pending}
-
-        try:
-            result = ACTION_TOOLS[tool](**args)
-            ok = result.get("status") != "error"
-        except TypeError as e:
-            ok = False
-            result = {"message": f"Argumen tidak valid: {e}"}
-
-        pending["state"] = "done" if ok else "failed"
-        pending["result"] = result.get("message") or ("Aksi berhasil dijalankan." if ok else "Aksi gagal.")
-        db_update_message_pending_action(message_id, pending)
-        return {"status": "success" if ok else "error", "pending_action": pending}
+    reloading the session shows the real outcome instead of "Awaiting" forever. Shares the
+    same logic as the Discord confirm buttons via agent.resolve_pending_action()."""
+    res = resolve_pending_action(message_id, req.approve)
+    return {
+        "status": "success" if res["ok"] else "error",
+        "message": res["message"],
+        "pending_action": res["pending_action"],
+    }
 
 
 @router.delete("/api/agent/sessions/{session_id}")

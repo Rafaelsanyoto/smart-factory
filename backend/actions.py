@@ -5,13 +5,11 @@ the same way. Each apply_* updates the in-memory mirror in state.py AND persists
 
 Also holds the read-payload builders (zones_payload / sources_payload) that both the REST
 endpoints and the agent's read tools return, so their shape stays identical."""
-import json
-
 from .config import (
-    MODEL_REGISTRY, PPE_TO_VIOLATION, EMERGENCY_CLASSES, CONTEXT_CLASSES, context_lock,
-    ALL_PPE, ALL_EMERGENCY, PERMISSION_MODES, stream_source_tokens, list_video_files, resolve_source,
+    MODEL_REGISTRY, ALL_CLASSES, URGENCY_LEVELS, PERMISSION_MODES,
+    stream_source_tokens, list_video_files, resolve_source,
 )
-from .database import engine_lock, db_save_config, db_save_zone_rules
+from .database import engine_lock, db_save_config, db_save_zone_classes
 from . import state
 from .camera import cameras
 
@@ -35,33 +33,35 @@ def apply_confidence(value):
     return {"status": "success", "confidence": state.active_confidence}
 
 
-def apply_zone_rules(stream_id, required=None, emergency=None):
+def apply_zone_classes(stream_id, classes):
+    """Update a zone's per-class config. `classes` maps class_name -> any subset of
+    {display, monitor, urgency}; changes are merged onto the existing config so partial
+    updates (e.g. just toggling monitor for one class) work."""
     if stream_id not in state.ZONE_RULES:
         return {"status": "error", "message": "unknown zone"}
-    if required is not None:
-        state.ZONE_RULES[stream_id]["required"] = [p for p in required if p in PPE_TO_VIOLATION]
-    if emergency is not None:
-        state.ZONE_RULES[stream_id]["emergency"] = [c for c in emergency if c in EMERGENCY_CLASSES]
+    current = state.ZONE_RULES[stream_id].get("classes", {})
+    for cls, cfg in (classes or {}).items():
+        if cls not in ALL_CLASSES or not isinstance(cfg, dict):
+            continue
+        entry = current.get(cls, {"display": True, "monitor": False, "urgency": "info"})
+        if "display" in cfg:
+            entry["display"] = bool(cfg["display"])
+        if "monitor" in cfg:
+            entry["monitor"] = bool(cfg["monitor"])
+        if cfg.get("urgency") in URGENCY_LEVELS:
+            entry["urgency"] = cfg["urgency"]
+        current[cls] = entry
+    state.ZONE_RULES[stream_id]["classes"] = current
     with engine_lock:
-        db_save_zone_rules(
-            stream_id, state.ZONE_RULES[stream_id]["label"],
-            state.ZONE_RULES[stream_id]["required"], state.ZONE_RULES[stream_id].get("emergency", []),
-        )
-    return {
-        "status": "success",
-        "stream_id": stream_id,
-        "required": state.ZONE_RULES[stream_id]["required"],
-        "emergency": state.ZONE_RULES[stream_id].get("emergency", []),
-    }
+        db_save_zone_classes(stream_id, state.ZONE_RULES[stream_id]["label"], current)
+    return {"status": "success", "stream_id": stream_id, "classes": current}
 
 
-def apply_context_visibility(class_name, visible):
-    if class_name not in CONTEXT_CLASSES:
-        return {"status": "error", "message": "unknown class"}
-    with context_lock, engine_lock:
-        state.context_visibility[class_name] = bool(visible)
-        db_save_config("context_visibility", json.dumps(state.context_visibility))
-    return {"status": "success", "class": class_name, "visible": bool(visible)}
+def apply_autonomous_mode(enabled):
+    state.autonomous_mode = bool(enabled)
+    with engine_lock:
+        db_save_config("autonomous_mode", "on" if state.autonomous_mode else "off")
+    return {"status": "success", "autonomous_mode": state.autonomous_mode}
 
 
 def apply_pause(stream_id, paused):
@@ -96,15 +96,10 @@ def apply_permission_mode(mode):
 # --- read-payload builders (shared by REST routes + agent read tools) ---------------
 def zones_payload():
     return {
-        "all_ppe": ALL_PPE,
-        "all_emergency": ALL_EMERGENCY,
+        "all_classes": ALL_CLASSES,
+        "urgency_levels": list(URGENCY_LEVELS),
         "zones": [
-            {
-                "stream_id": sid,
-                "label": rule["label"],
-                "required": rule["required"],
-                "emergency": rule.get("emergency", []),
-            }
+            {"stream_id": sid, "label": rule["label"], "classes": rule.get("classes", {})}
             for sid, rule in state.ZONE_RULES.items()
         ],
     }

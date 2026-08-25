@@ -5,6 +5,8 @@ dataset/
 dist/
 .env
 smart_factory.db
+feedback_evidence/
+reports/
 
 VIdeo Testing/*
 !VIdeo Testing/.gitkeep

@@ -1,7 +1,9 @@
 import {
   Bot, User, Loader2, CheckCircle, XCircle, Zap, Sparkles,
-  Search, CheckCircle2, BrainCircuit, ShieldAlert,
+  Search, CheckCircle2, BrainCircuit, ShieldAlert, FileDown,
 } from 'lucide-react';
+
+const API_BASE = 'http://127.0.0.1:8000';
 
 function StepRow({ step }) {
   if (step.step === 'thinking') {
@@ -134,6 +136,21 @@ export default function AgentConversation({ messages, sessionId, onResolveAction
                 }`}
               >
                 {m.text}
+              </div>
+            )}
+
+            {m.reports && m.reports.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {m.reports.map((r) => (
+                  <a
+                    key={r.filename}
+                    href={r.download_url || `${API_BASE}/api/reports/file/${r.filename}`}
+                    download
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-600/15 border border-blue-500/40 text-blue-300 hover:bg-blue-600/25 text-xs font-semibold transition-colors"
+                  >
+                    <FileDown size={14} /> Unduh {(r.format || 'file').toUpperCase()}
+                  </a>
+                ))}
               </div>
             )}
 

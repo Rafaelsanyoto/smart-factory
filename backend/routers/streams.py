@@ -3,7 +3,6 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..config import CONTEXT_CLASSES
 from ..camera import cameras, generate_video_stream
 from .. import state
 from ..actions import apply_source, apply_pause, sources_payload
@@ -24,7 +23,7 @@ async def stream_data(stream_id: str):
     cam = cameras.get(stream_id)
     visible = [
         d for d in state.latest_detections.get(stream_id, [])
-        if d["class_name"] not in CONTEXT_CLASSES or state.is_context_visible(d["class_name"])
+        if state.is_class_visible(stream_id, d["class_name"])
     ]
     return {
         "status": "success",

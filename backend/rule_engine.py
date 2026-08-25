@@ -7,9 +7,9 @@ instead of collapsing into one."""
 import time
 import uuid
 
+from .config import EMERGENCY_CLASSES
 from . import state
 from .database import engine_lock, db_insert_event, db_next_seq
-from .notifications import notify_safety
 
 # Episode tracking, keyed by "{stream_id}|{cls}" (zone + violation/emergency class) ->
 # a LIST of concurrent episodes, one per distinct physical location.
@@ -48,21 +48,23 @@ def _iou(box_a, box_b):
 def process_rules(stream_id, boxes):
     """Turns raw detections into structured events (episode model with IoU matching, see
     module docstring). Called from each camera's ai_loop (multiple threads) -> guarded by
-    engine_lock."""
+    engine_lock.
+
+    Returns a list of (event, box) for events newly created this call, so the caller (which
+    holds the video frame) can crop the detection for evidence/vision and then notify. This
+    function no longer notifies directly — the crop has to be captured first."""
     now_ms = time.time() * 1000
     zone = state.ZONE_RULES.get(stream_id, {}).get("label", stream_id)
-    violation_classes = state.violation_classes_for(stream_id)
-    zone_emergency_classes = state.emergency_classes_for(stream_id)
+    monitored = state.monitored_classes_for(stream_id)  # {class_name: urgency}
+    new_events = []
 
     with engine_lock:
         for box in boxes:
             cls = box["class_name"]
-            if cls in violation_classes:
-                event_type = "VIOLATION"
-            elif cls in zone_emergency_classes:
-                event_type = "EMERGENCY"
-            else:
+            if cls not in monitored:
                 continue
+            urgency = monitored[cls]
+            event_type = "EMERGENCY" if cls in EMERGENCY_CLASSES else "VIOLATION"
 
             key = f"{stream_id}|{cls}"
             box_xyxy = box.get("xyxy")
@@ -107,11 +109,15 @@ def process_rules(stream_id, boxes):
                     "stream_id": stream_id,
                     "zone": zone,
                     "type": event_type,
+                    "urgency": urgency,        # info | warning | critical (per-zone per-class)
                     "class": cls,
                     "track_id": box.get("track_id"),
                     "confidence": box.get("confidence"),
                     "status": "PENDING",       # PENDING -> CONFIRMED | DISMISSED -> (or DELETED)
                     "verified_at": None,
+                    "verified_by": None,       # "agent" when confirmed by autonomous handling
+                    "agent_verdict": None,     # real | false | uncertain (autonomous opinion)
+                    "agent_reasoning": None,
                     "action_taken": False,     # remediation recorded on a CONFIRMED event
                     "action_note": None,
                     "action_at": None,
@@ -120,9 +126,11 @@ def process_rules(stream_id, boxes):
                     "deleted_at": None,        # these two are mutually exclusive.
                 }
                 db_insert_event(event)
-                notify_safety(event)
+                new_events.append((event, box))
 
             # Surface the rule engine's decision back on the box itself, so the UI can
             # show which detections are suppressed (already notified this episode) vs
             # still pending confirmation.
             box["episode_status"] = "notified" if stat["notified"] else "pending"
+
+    return new_events

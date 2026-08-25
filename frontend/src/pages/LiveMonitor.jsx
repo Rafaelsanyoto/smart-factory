@@ -1,10 +1,34 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Camera, ShieldAlert, CheckCircle, XCircle, MapPin, AlertTriangle,
-  Video, Flame, Bot, ScanLine, Pause, Play, Clock, CheckCheck, Info, Send, Loader2, Trash2, Hash,
+  Video, Flame, Bot, ScanLine, Pause, Play, Clock, CheckCheck, Info, Send, Loader2, Trash2, Hash, Radar,
 } from 'lucide-react';
 
 const API_BASE = 'http://127.0.0.1:8000';
+
+// Urgency tier -> static badge classes (per-zone per-class severity).
+const URGENCY_META = {
+  info: { label: 'INFO', cls: 'text-slate-400 bg-slate-800/60 border-slate-700' },
+  warning: { label: 'WARNING', cls: 'text-amber-300 bg-amber-950/50 border-amber-800/40' },
+  critical: { label: 'CRITICAL', cls: 'text-red-300 bg-red-950/50 border-red-800/40' },
+};
+
+// The autonomous agent's opinion on a still-PENDING incident (it never auto-dismisses —
+// false/uncertain are left for a human, with this note attached).
+const AGENT_VERDICT_META = {
+  real: { label: 'AI: pelanggaran nyata', cls: 'text-emerald-300 bg-emerald-950/40 border-emerald-800/40' },
+  false: { label: 'AI: kemungkinan salah deteksi', cls: 'text-slate-300 bg-slate-800/60 border-slate-700' },
+  uncertain: { label: 'AI: ragu — perlu review', cls: 'text-amber-300 bg-amber-950/40 border-amber-800/40' },
+};
+
+// A CONFIRMED incident is "overdue" if it's been awaiting a human's remediation longer than
+// its urgency allows — mirrors the backend reminder cadence (critical 2m / warning 10m).
+const OVERDUE_MS = { critical: 120_000, warning: 600_000 };
+function isOverdue(log) {
+  if (log.actionTaken || !log.tsMs) return false;
+  const limit = OVERDUE_MS[log.urgency];
+  return limit ? Date.now() - log.tsMs > limit : false;
+}
 
 const CAMERA_REGISTRY = [
   { id: 'stream_01', label: 'Assembly Line A (Cam 01)' },
@@ -352,12 +376,25 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
                   <div key={incident.id} className={`bg-slate-950 border p-3.5 rounded-lg space-y-2.5 ${isEmergency ? 'border-orange-500/40' : 'border-amber-500/30'}`}>
                     <div className="flex justify-between items-center text-xs">
                       <span className="font-mono text-slate-500 flex items-center gap-1"><Hash size={10} />{incident.seq ?? '?'} · {incident.time}</span>
-                      <span className={`font-bold px-2 py-0.5 rounded border flex items-center gap-1 ${
-                        isEmergency ? 'text-orange-300 bg-orange-950/50 border-orange-800/40' : 'text-red-400 bg-red-950/50 border-red-800/40'
-                      }`}>
-                        {isEmergency && <Flame size={11} />}{incident.type}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        {incident.urgency && URGENCY_META[incident.urgency] && (
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${URGENCY_META[incident.urgency].cls}`}>
+                            {URGENCY_META[incident.urgency].label}
+                          </span>
+                        )}
+                        <span className={`font-bold px-2 py-0.5 rounded border flex items-center gap-1 ${
+                          isEmergency ? 'text-orange-300 bg-orange-950/50 border-orange-800/40' : 'text-red-400 bg-red-950/50 border-red-800/40'
+                        }`}>
+                          {isEmergency && <Flame size={11} />}{incident.type}
+                        </span>
+                      </div>
                     </div>
+                    {incident.verifiedBy === 'agent' && incident.agentVerdict && AGENT_VERDICT_META[incident.agentVerdict] && (
+                      <div className={`text-[10px] px-2 py-1 rounded border flex items-start gap-1.5 ${AGENT_VERDICT_META[incident.agentVerdict].cls}`}>
+                        <Radar size={11} className="mt-0.5 shrink-0" />
+                        <span><span className="font-semibold">{AGENT_VERDICT_META[incident.agentVerdict].label}.</span> {incident.agentReasoning}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between items-center pt-1">
                       <span className="text-[11px] text-slate-300 flex items-center gap-1"><MapPin size={12} /> {incident.zone}</span>
                       <div className="flex gap-1.5">
@@ -411,10 +448,22 @@ export default function LiveMonitor({ pendingIncidents = [], verifiedIncidents =
                 <div key={log.id} className="bg-slate-950 border border-slate-800 p-3 rounded-lg text-xs">
                   <div className="flex justify-between items-center">
                     <div>
-                      <span className="font-bold text-red-400 block">{log.type}</span>
+                      <span className="font-bold text-red-400 flex items-center gap-1.5">
+                        {log.type}
+                        {log.verifiedBy === 'agent' && (
+                          <span title="Dikonfirmasi otomatis oleh AI" className="text-[8px] font-bold px-1 py-0.5 rounded border text-purple-300 bg-purple-950/40 border-purple-700/50 flex items-center gap-0.5">
+                            <Radar size={8} /> AI
+                          </span>
+                        )}
+                      </span>
                       <span className="text-slate-500 font-mono text-[10px] flex items-center gap-1"><Hash size={9} />{log.seq ?? '?'} · {log.time}</span>
                     </div>
                     <div className="flex items-center gap-1.5">
+                      {isOverdue(log) && (
+                        <span title="Belum ditindak melewati batas waktu urgensinya" className="text-[9px] font-bold px-1.5 py-0.5 rounded border text-red-300 bg-red-950/50 border-red-700/50 flex items-center gap-0.5 animate-pulse">
+                          <Clock size={9} /> OVERDUE
+                        </span>
+                      )}
                       <span className="text-slate-300 bg-slate-900 px-2 py-1 rounded border border-slate-800 text-[11px]">{log.zone}</span>
                       {!log.actionTaken && (
                         <button onClick={() => handleDeleteIncident(log.id)} title="Hapus (duplikat)" className="p-1.5 bg-slate-900 hover:bg-red-950/60 text-slate-500 hover:text-red-400 rounded border border-slate-800">

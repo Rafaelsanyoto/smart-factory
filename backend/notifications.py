@@ -6,9 +6,14 @@ action/delete outcomes are dispatched immediately in a background thread."""
 import json
 import threading
 import urllib.request
+import uuid
 
 from .config import DISCORD_WEBHOOK_URL, DISCORD_WEBHOOK_URL_ACTIONS
 from .database import engine_lock, db_insert_notification, db_update_notification
+from . import state
+
+# Icon per urgency tier — drives the notification's visual weight.
+URGENCY_ICON = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}
 
 
 def _pct(confidence):
@@ -18,24 +23,25 @@ def _pct(confidence):
 def format_notification(event):
     """Deterministic, consistently-formatted notification for a single event — same
     structure every time (bold labels + bullet points), no LLM involved so wording never
-    varies from one violation to the next.
+    varies from one violation to the next. Icon + severity follow the event's urgency tier.
     """
+    urgency = event.get("urgency", "warning")
     is_emergency = event["type"] == "EMERGENCY"
-    icon = "🚨" if is_emergency else "⚠️"
-    header = "DARURAT TERDETEKSI" if is_emergency else "PELANGGARAN APD TERDETEKSI"
+    icon = URGENCY_ICON.get(urgency, "⚠️")
+    header = "DARURAT TERDETEKSI" if is_emergency else "PELANGGARAN TERDETEKSI"
     action = "Segera evakuasi & hubungi tim darurat" if is_emergency else "Menunggu tindakan tim safety"
-    severity = "critical" if is_emergency else "warning"
 
     lines = [
         f"{icon} **{header}**",
         f"• **Insiden:** #{event.get('seq', '?')}",
+        f"• **Urgensi:** {urgency.upper()}",
         f"• **Zona:** {event['zone']}",
         f"• **Jenis:** {event['class']}",
         f"• **Waktu:** {event['timestamp']}",
         f"• **Confidence:** {_pct(event.get('confidence'))}",
         f"• **Status:** {action}",
     ]
-    return "\n".join(lines), severity
+    return "\n".join(lines), urgency
 
 
 def format_batch_notification(batch_events):
@@ -45,7 +51,9 @@ def format_batch_notification(batch_events):
     instead of one each.
     """
     has_emergency = any(e["type"] == "EMERGENCY" for e in batch_events)
-    icon = "🚨" if has_emergency else "⚠️"
+    urgencies = [e.get("urgency", "warning") for e in batch_events]
+    top_urgency = "critical" if "critical" in urgencies else ("warning" if "warning" in urgencies else "info")
+    icon = URGENCY_ICON.get(top_urgency, "⚠️")
     header = f"{len(batch_events)} KEJADIAN TERDETEKSI BERSAMAAN"
     action = "Segera evakuasi & hubungi tim darurat" if has_emergency else "Menunggu tindakan tim safety"
 
@@ -60,7 +68,7 @@ def format_batch_notification(batch_events):
         lines.append(f"• **{zone}:** {items}")
     lines.append(f"• **Waktu:** {batch_events[0]['timestamp']}")
     lines.append(f"• **Status:** {action}")
-    return "\n".join(lines), ("critical" if has_emergency else "warning")
+    return "\n".join(lines), top_urgency
 
 
 def format_action_notification(event):
@@ -95,20 +103,42 @@ def format_delete_notification(event):
     return "\n".join(lines)
 
 
-def send_discord(text, webhook_url):
-    """Dispatch a message to a specific Discord webhook. Returns True on confirmed delivery."""
+def _multipart_body(text, images):
+    """Build a multipart/form-data body carrying the message + up to 10 JPEG attachments,
+    as Discord's webhook API expects (payload_json field + files[i] parts)."""
+    boundary = "----SmartFactoryHSE" + uuid.uuid4().hex
+    payload = json.dumps({"content": str(text)[:1900]})
+    out = []
+    out.append(f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'
+               f'Content-Type: application/json\r\n\r\n{payload}\r\n'.encode())
+    for i, img in enumerate(images[:10]):
+        out.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="files[{i}]"; '
+            f'filename="evidence_{i}.jpg"\r\nContent-Type: image/jpeg\r\n\r\n'.encode()
+        )
+        out.append(img)
+        out.append(b"\r\n")
+    out.append(f"--{boundary}--\r\n".encode())
+    return b"".join(out), boundary
+
+
+def send_discord(text, webhook_url, images=None):
+    """Dispatch a message to a specific Discord webhook, optionally with JPEG evidence
+    attachments. Returns True on confirmed delivery."""
     if not webhook_url:
         return False
-    body = json.dumps({"content": str(text)[:1900]}).encode()  # Discord caps at 2000 chars
     # A User-Agent header is required — Discord's Cloudflare front rejects the default
     # urllib agent ("Python-urllib/x.y") with 403 Forbidden.
-    req = urllib.request.Request(
-        webhook_url,
-        data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "SmartFactoryHSE/1.0"},
-    )
+    headers = {"User-Agent": "SmartFactoryHSE/1.0"}
+    if images:
+        body, boundary = _multipart_body(text, images)
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    else:
+        body = json.dumps({"content": str(text)[:1900]}).encode()  # Discord caps at 2000 chars
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(webhook_url, data=body, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status in (200, 204)
     except Exception as e:
         print(f"[AI AGENT] Discord send failed: {e}")
@@ -128,13 +158,13 @@ def configured_channel(purpose="detection"):
     return None
 
 
-def dispatch_message(text, purpose="detection"):
+def dispatch_message(text, purpose="detection", images=None):
     """Send to whichever external channel is configured for this purpose. Returns
     (sent, channel)."""
     if purpose == "action" and DISCORD_WEBHOOK_URL_ACTIONS:
-        return send_discord(text, DISCORD_WEBHOOK_URL_ACTIONS), "discord"
+        return send_discord(text, DISCORD_WEBHOOK_URL_ACTIONS, images), "discord"
     if DISCORD_WEBHOOK_URL:
-        return send_discord(text, DISCORD_WEBHOOK_URL), "discord"
+        return send_discord(text, DISCORD_WEBHOOK_URL, images), "discord"
     return False, None
 
 
@@ -166,14 +196,17 @@ def _flush_batch():
     else:
         text, _ = format_batch_notification(batch_events)
 
-    sent, channel = dispatch_message(text)
+    # Attach the cropped detection(s) as photo evidence (Discord allows up to 10).
+    images = [state.event_crops[e["id"]] for e in batch_events if e["id"] in state.event_crops]
+
+    sent, channel = dispatch_message(text, images=images or None)
 
     with engine_lock:
         for note_id in note_ids:
             db_update_notification(note_id, message=text, dispatched=sent, channel=channel)
 
     if sent:
-        print(f"[AI AGENT] {channel} dispatched (batch of {len(batch_events)}): {text}")
+        print(f"[AI AGENT] {channel} dispatched (batch of {len(batch_events)}, {len(images)} img)")
 
 
 def notify_safety(event):
@@ -200,6 +233,12 @@ def notify_safety(event):
     print(f"[AI AGENT] {msg}")
     with engine_lock:
         db_insert_notification(note)
+
+    # Escalation tiers: 'info' is logged only (recorded above, visible in the dashboard log)
+    # and NOT pushed to Discord. 'warning'/'critical' go out to the external channel via the
+    # debounced batch below.
+    if event.get("urgency", "warning") == "info":
+        return
 
     global _batch_timer
     with _batch_lock:
