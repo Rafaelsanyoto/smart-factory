@@ -25,7 +25,6 @@ function NavLink({ to, icon: Icon, label }) {
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   
-  // Lifted State: This memory persists even when navigating away from the Live Monitor
   const [pendingIncidents, setPendingIncidents] = useState([]);
   const [verifiedIncidents, setVerifiedIncidents] = useState([]);
 
@@ -69,7 +68,6 @@ export default function App() {
 
         <main className="p-6">
           <Routes>
-            {/* THIS ROUTE MUST HAVE ALL 4 PROPS */}
             <Route 
               path="/" 
               element={
